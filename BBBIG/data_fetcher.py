@@ -136,12 +136,14 @@ class StockDataFetcher:
         df = df.reset_index(drop=True)
         return df
 
-    def fetch_stock_kline(self, code: str, days: int = 30, adjust: str = "qfq") -> pd.DataFrame:
+    def fetch_stock_kline(self, code: str, days: int = 30, adjust: str = "qfq",
+                          end_date_str: str = None) -> pd.DataFrame:
         """
         获取个股日K线数据
         :param code: 股票代码
         :param days: 获取天数
         :param adjust: qfq-前复权, hfq-后复权, 空-不复权
+        :param end_date_str: 结束日期，格式 YYYYMMDD，默认为当天
         """
         code_id_dict = self._get_code_id_map()
         if code not in code_id_dict:
@@ -149,8 +151,12 @@ class StockDataFetcher:
             return pd.DataFrame()
 
         adjust_dict = {"qfq": "1", "hfq": "2", "": "0"}
-        start_date = (datetime.now() - timedelta(days=days + 15)).strftime("%Y%m%d")
-        end_date = datetime.now().strftime("%Y%m%d")
+        if end_date_str:
+            ref_date = datetime.strptime(end_date_str, "%Y%m%d")
+        else:
+            ref_date = datetime.now()
+        start_date = (ref_date - timedelta(days=days + 15)).strftime("%Y%m%d")
+        end_date = ref_date.strftime("%Y%m%d")
 
         url = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
         params = {

@@ -1,0 +1,36 @@
+{
+  "timestamp": "2026-03-10 23:57:35",
+  "backtest_weeks": [
+    1,
+    2,
+    3
+  ],
+  "rounds": [
+    {
+      "weeks_ago": 1,
+      "analysis_date": "2026-03-03",
+      "market_analysis": "市场呈现结构性分化，部分板块（如电力、通信设备）在经历快速上涨后出现高位震荡和获利回吐，技术性调整压力显现。整体成交量有所放大，显示资金活跃，但需警惕短期追高风险，建议关注趋势稳固、量价配合良好的个股。",
+      "total_recommendations": 10,
+      "profit_count": 7,
+      "loss_count": 2,
+      "neutral_count": 1,
+      "win_rate": "70.0%",
+      "evaluations": [
+        {
+          "code": "000988",
+          "name": "华工科技",
+          "suggested_buy_range": "94.0-96.5",
+          "target_price": 110.0,
+          "stop_loss": 89.8,
+          "buy_low": 94.0,
+          "buy_high": 96.5,
+          "target_price_val": 110.0,
+          "stop_loss_val": 89.8,
+          "buy_price": 95.25,
+          "max_price": 124.0,
+          "min_price": 93.85,
+          "end_price": 123.51,
+          "max_profit_pct": 30.18,
+          "max_loss_pct": -1.47,
+          "final_profit_pct": 29.67,
+          "hit_target": 

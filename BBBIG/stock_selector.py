@@ -231,11 +231,37 @@ def run_stock_selection() -> dict:
         result["analysis"] = str(analysis_result)
 
     logger.info(f"选股完成，推荐 {len(result['recommendations'])} 只股票")
+
+    # 自动对推荐股票执行回测验证，按盈利概率排序
+    if result["recommendations"]:
+        logger.info("开始对推荐股票进行回测验证...")
+        from BBBIG.backtester import backtest_stock_list
+        backtest_report = backtest_stock_list(result["recommendations"], weeks_list=[1, 2, 3])
+        result["backtest_report"] = backtest_report
+        # 按盈利概率重新排序 recommendations
+        if backtest_report.get("stock_results"):
+            ranked_codes = [sr["code"] for sr in backtest_report["stock_results"]]
+            rec_map = {r["code"]: r for r in result["recommendations"]}
+            sorted_recs = []
+            for i, code in enumerate(ranked_codes):
+                if code in rec_map:
+                    rec = rec_map[code]
+                    rec["rank"] = i + 1
+                    # 附加回测数据
+                    sr = next((s for s in backtest_report["stock_results"] if s["code"] == code), None)
+                    if sr:
+                        rec["backtest_win_rate"] = sr["win_rate"]
+                        rec["backtest_avg_profit"] = sr["avg_profit_pct"]
+                        rec["backtest_rounds"] = sr["rounds"]
+                    sorted_recs.append(rec)
+            result["recommendations"] = sorted_recs
+            logger.info("推荐股票已按回测盈利概率重新排序")
+
     return result
 
 
 def format_selection_report(result: dict) -> str:
-    """将选股结果格式化为可读报告"""
+    """将选股结果格式化为可读报告（含回测验证）"""
     lines = []
     lines.append("=" * 70)
     lines.append(f"  BBBIG 智能选股报告  {result['timestamp']}")
@@ -249,9 +275,32 @@ def format_selection_report(result: dict) -> str:
         lines.append(result["analysis"])
 
     if result.get("recommendations"):
+        has_backtest = any("backtest_win_rate" in r for r in result["recommendations"])
+
         lines.append(f"\n{'=' * 70}")
-        lines.append(f"  推荐股票 TOP {len(result['recommendations'])}")
+        if has_backtest:
+            lines.append(f"  推荐股票 TOP {len(result['recommendations'])}（按回测盈利概率排序）")
+        else:
+            lines.append(f"  推荐股票 TOP {len(result['recommendations'])}")
         lines.append("=" * 70)
+
+        if has_backtest:
+            lines.append(f"\n  {'排名':<4} {'代码':<8} {'名称':<8} {'盈利概率':>8} "
+                         f"{'平均收益':>8} {'买入区间':>14} {'目标价':>8} {'止损价':>8}")
+            lines.append("─" * 70)
+            for rec in result["recommendations"]:
+                lines.append(
+                    f"  #{rec.get('rank', '?'):<3} {rec.get('code', ''):<8} "
+                    f"{rec.get('name', ''):<8} "
+                    f"{rec.get('backtest_win_rate', 0):>6.1f}% "
+                    f"{rec.get('backtest_avg_profit', 0):>+7.2f}% "
+                    f"{str(rec.get('suggested_buy_range', '')):>14} "
+                    f"{str(rec.get('target_price', '')):>8} "
+                    f"{str(rec.get('stop_loss', '')):>8}"
+                )
+            lines.append("─" * 70)
+
+        lines.append("")
         for rec in result["recommendations"]:
             lines.append(f"\n  #{rec.get('rank', '?')} {rec.get('code', '')} {rec.get('name', '')}")
             lines.append(f"  行业: {rec.get('industry', '-')}")
@@ -260,7 +309,37 @@ def format_selection_report(result: dict) -> str:
             lines.append(f"  建议买入区间: {rec.get('suggested_buy_range', '-')}")
             lines.append(f"  短期目标价: {rec.get('target_price', '-')}")
             lines.append(f"  止损价: {rec.get('stop_loss', '-')}")
+
+            if "backtest_win_rate" in rec:
+                lines.append(f"  📊 回测盈利概率: {rec['backtest_win_rate']:.1f}% | "
+                             f"平均收益: {rec.get('backtest_avg_profit', 0):+.2f}%")
+                for rd in rec.get("backtest_rounds", []):
+                    outcome = rd.get("outcome", "")
+                    if "盈利" in outcome:
+                        mark = "✅"
+                    elif "止损" in outcome:
+                        mark = "❌"
+                    else:
+                        mark = "➖"
+                    lines.append(f"    {mark} {rd['weeks_ago']}周前({rd['date']}): "
+                                 f"买{rd.get('buy_price', 0):.2f} → "
+                                 f"高{rd.get('max_price', 0):.2f} 低{rd.get('min_price', 0):.2f} "
+                                 f"收{rd.get('end_price', 0):.2f} | "
+                                 f"{outcome} ({rd.get('realized_pct', 0):+.2f}%)")
             lines.append("-" * 50)
+
+        # 回测汇总
+        if result.get("backtest_report"):
+            bt_summary = result["backtest_report"].get("summary", {})
+            lines.append(f"\n{'=' * 70}")
+            lines.append("  📊 回测验证汇总")
+            lines.append("=" * 70)
+            lines.append(f"  回测方式: 往前推 {result['backtest_report'].get('backtest_weeks', [])} 周")
+            lines.append(f"  总回测轮数: {bt_summary.get('total_rounds', 0)} | "
+                         f"总盈利: {bt_summary.get('total_wins', 0)} | "
+                         f"总止损: {bt_summary.get('total_losses', 0)}")
+            lines.append(f"  总胜率: {bt_summary.get('overall_win_rate', '0%')} | "
+                         f"平均收益: {bt_summary.get('avg_profit_pct', 0):+.2f}%")
     else:
         lines.append("\n暂无推荐股票")
 

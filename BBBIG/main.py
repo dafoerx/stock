@@ -11,6 +11,7 @@ BBBIG 主入口
   python -m BBBIG.main list            # 查看持仓列表
   python -m BBBIG.main serve           # 启动每日定时调度器
   python -m BBBIG.main web [端口]      # 启动 Web 可视化界面（默认端口 9999）
+  python -m BBBIG.main backtest [1,2,3]  # 回测验证（往前推N周选股并验证盈亏）
 """
 import sys
 import os
@@ -138,6 +139,22 @@ def cmd_web(args):
     start_web(port=port)
 
 
+def cmd_backtest(args):
+    """回测验证选股准确率"""
+    from BBBIG.backtester import run_backtest, format_backtest_report
+    weeks_list = [1, 2, 3]
+    if args:
+        try:
+            weeks_list = [int(x) for x in args[0].split(",")]
+        except ValueError:
+            print("用法: python -m BBBIG.main backtest [1,2,3]")
+            print("示例: python -m BBBIG.main backtest 1,2,3")
+            return
+    print(f"开始回测验证（往前推 {weeks_list} 周）...\n")
+    report = run_backtest(weeks_list)
+    print(format_backtest_report(report))
+
+
 def print_usage():
     """打印使用说明"""
     print("""
@@ -156,6 +173,7 @@ BBBIG - A股智能选股与持仓分析系统
   list                查看持仓列表
   serve               启动每日定时调度器（每天18:00自动执行）
   web [端口]           启动 Web 可视化界面（默认端口 9999）
+  backtest [1,2,3]    回测验证（往前推N周选股并用真实K线验证盈亏）
 
 示例:
   python -m BBBIG.main select
@@ -163,6 +181,8 @@ BBBIG - A股智能选股与持仓分析系统
   python -m BBBIG.main add 600519 1700.00 100 贵州茅台
   python -m BBBIG.main analyze
   python -m BBBIG.main web
+  python -m BBBIG.main backtest
+  python -m BBBIG.main backtest 1,2
   python -m BBBIG.main serve
 """)
 
@@ -186,6 +206,7 @@ def main():
         "list": lambda: cmd_list(),
         "serve": lambda: cmd_serve(),
         "web": lambda: cmd_web(args),
+        "backtest": lambda: cmd_backtest(args),
     }
 
     if command in commands:
