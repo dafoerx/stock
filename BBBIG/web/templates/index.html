@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BBBIG - A股智能选股与持仓分析</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <!-- 侧边栏 -->
+    <aside class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+            <div class="logo">
+                <span class="logo-icon">📈</span>
+                <span class="logo-text">BBBIG</span>
+            </div>
+            <div class="logo-subtitle">AI 智能选股</div>
+        </div>
+        <nav class="sidebar-nav">
+            <a href="#" class="nav-item active" data-page="dashboard">
+                <span class="nav-icon">🏠</span>
+                <span class="nav-label">仪表盘</span>
+            </a>
+            <a href="#" class="nav-item" data-page="selection">
+                <span class="nav-icon">🔍</span>
+                <span class="nav-label">智能选股</span>
+            </a>
+            <a href="#" class="nav-item" data-page="portfolio">
+                <span class="nav-icon">💼</span>
+                <span class="nav-label">持仓分析</span>
+            </a>
+            <a href="#" class="nav-item" data-page="history">
+                <span class="nav-icon">📋</span>
+                <span class="nav-label">历史记录</span>
+            </a>
+        </nav>
+        <div class="sidebar-footer">
+            <div class="footer-info">Powered by DeepSeek V3.2</div>
+        </div>
+    </aside>
+
+    <!-- 主内容 -->
+    <main class="main-content" id="mainContent">
+        <!-- 顶栏 -->
+        <header class="topbar">
+            <button class="menu-toggle" id="menuToggle">☰</button>
+            <h1 class="page-title" id="pageTitle">仪表盘</h1>
+            <div class="topbar-right">
+                <span class="current-time" id="currentTime"></span>
+            </div>
+        </header>
+
+        <!-- 页面容器 -->
+        <div class="page-container">
+
+            <!-- ========== 仪表盘页 ========== -->
+            <div class="page active" id="page-dashboard">
+                <div class="stats-grid">
+                    <div class="stat-card stat-primary">
+                        <div class="stat-icon">🔍</div>
+                        <div class="stat-info">
+                            <div class="stat-value" id="statSelectionCount">-</div>
+                            <div class="stat-label">推荐股票数</div>
+                        </div>
+                    </div>
+                    <div class="stat-card stat-success">
+                        <div class="stat-icon">💼</div>
+                        <div class="stat-info">
+                            <div class="stat-value" id="statHoldingCount">-</div>
+                            <div class="stat-label">持仓股票数</div>
+                        </div>
+                    </div>
+                    <div class="stat-card stat-warning">
+                        <div class="stat-icon">⏱️</div>
+                        <div class="stat-info">
+                            <div class="stat-value" id="statLastSelection">-</div>
+                            <div class="stat-label">上次选股</div>
+                        </div>
+                    </div>
+                    <div class="stat-card stat-info">
+                        <div class="stat-icon">📊</div>
+                        <div class="stat-info">
+                            <div class="stat-value" id="statLastAnalysis">-</div>
+                            <div class="stat-label">上次持仓分析</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="content-grid">
+                    <div class="card">
+                        <div class="card-header">
+                            <h3>最新推荐股票 TOP10</h3>
+                            <button class="btn btn-primary btn-sm" onclick="navigateTo('selection')">查看详情 →</button>
+                        </div>
+                        <div class="card-body" id="dashRecommendations">
+                            <div class="empty-state">
+                                <div class="empty-icon">🔍</div>
+                                <p>暂无推荐数据，点击「智能选股」开始分析</p>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <div class="card-header">
+                            <h3>持仓概览</h3>
+                            <button class="btn btn-primary btn-sm" onclick="navigateTo('portfolio')">管理持仓 →</button>
+                        </div>
+                        <div class="card-body" id="dashPortfolio">
+                            <div class="empty-state">
+                                <div class="empty-icon">💼</div>
+                                <p>暂无持仓，点击「持仓分析」添加</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card mt-20">
+                    <div class="card-header">
+                        <h3>市场热点分析</h3>
+                    </div>
+                    <div class="card-body" id="dashMarketAnalysis">
+                        <div class="empty-state">
+                            <div class="empty-icon">📊</div>
+                            <p>执行选股分析后将展示市场热点</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ========== 智能选股页 ========== -->
+            <div class="page" id="page-selection">
+                <div class="card">
+                    <div class="card-header">
+                        <h3>智能选股</h3>
+                        <div class="header-actions">
+                            <span class="status-badge" id="selectionStatus">就绪</span>
+                            <button class="btn btn-primary" id="btnRunSelection" onclick="runSelection()">
+                                <span class="btn-icon">🚀</span> 开始选股
+                            </button>
+                        </div>
+                    </div>
+                    <div class="card-body">
+                        <div class="info-bar">
+                            <span>选股引擎：DeepSeek V3.2 大模型</span>
+                            <span>分析维度：热点板块 + K线趋势 + 成交量 + 基本面</span>
+                            <span id="selectionLastRun"></span>
+                        </div>
+                        <!-- 进度条 -->
+                        <div class="progress-bar-container" id="selectionProgress" style="display:none;">
+                            <div class="progress-bar">
+                                <div class="progress-bar-fill progress-animated"></div>
+                            </div>
+                            <div class="progress-text">正在分析中，请稍候（预计1-3分钟）...</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 市场分析 -->
+                <div class="card mt-20" id="selectionAnalysisCard" style="display:none;">
+                    <div class="card-header"><h3>📊 市场热点分析</h3></div>
+                    <div class="card-body">
+                        <div class="analysis-text" id="selectionAnalysisText"></div>
+                    </div>
+                </div>
+
+                <!-- 板块资金流 -->
+                <div class="card mt-20" id="selectionSectorsCard" style="display:none;">
+                    <div class="card-header"><h3>💰 板块资金流向</h3></div>
+                    <div class="card-body">
+                        <pre class="sector-text" id="selectionSectorsText"></pre>
+                    </div>
+                </div>
+
+                <!-- 推荐列表 -->
+                <div class="card mt-20" id="selectionResultCard" style="display:none;">
+                    <div class="card-header"><h3>🏆 推荐股票 TOP10</h3></div>
+                    <div class="card-body">
+                        <div class="stock-grid" id="selectionResultList"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ========== 持仓分析页 ========== -->
+            <div class="page" id="page-portfolio">
+                <!-- 添加持仓 -->
+                <div class="card">
+                    <div class="card-header">
+                        <h3>持仓管理</h3>
+                    </div>
+                    <div class="card-body">
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>股票代码</label>
+                                <input type="text" id="inputCode" placeholder="如 000001" maxlength="6">
+                            </div>
+                            <div class="form-group">
+                                <label>成本价</label>
+                                <input type="number" id="inputCost" placeholder="如 12.50" step="0.01">
+                            </div>
+                            <div class="form-group">
+                                <label>持有股数</label>
+                                <input type="number" id="inputShares" placeholder="如 1000" step="100">
+                            </div>
+                            <div class="form-group">
+                                <label>股票名称</label>
+                                <input type="text" id="inputName" placeholder="可选">
+                            </div>
+                            <div class="form-group form-action">
+                                <button class="btn btn-primary" onclick="addHolding()">
+                                    <span class="btn-icon">➕</span> 添加持仓
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 持仓列表 -->
+                <div class="card mt-20">
+                    <div class="card-header">
+                        <h3>当前持仓</h3>
+                        <div class="header-actions">
+                            <span class="status-badge" id="portfolioStatus">就绪</span>
+                            <button class="btn btn-primary" id="btnRunAnalysis" onclick="runPortfolioAnalysis()">
+                                <span class="btn-icon">🤖</span> AI 分析持仓
+                            </button>
+                        </div>
+                    </div>
+                    <div class="card-body">
+                        <div class="progress-bar-container" id="portfolioProgress" style="display:none;">
+                            <div class="progress-bar">
+                                <div class="progress-bar-fill progress-animated"></div>
+                            </div>
+                            <div class="progress-text">正在分析持仓，请稍候...</div>
+                        </div>
+                        <div id="portfolioList">
+                            <div class="empty-state">
+                                <div class="empty-icon">💼</div>
+                                <p>暂无持仓，请在上方添加</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 分析结果 -->
+                <div class="card mt-20" id="portfolioResultCard" style="display:none;">
+                    <div class="card-header"><h3>🤖 AI 持仓分析结果</h3></div>
+                    <div class="card-body">
+                        <div id="portfolioAnalysisResult"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ========== 历史记录页 ========== -->
+            <div class="page" id="page-history">
+                <div class="card">
+                    <div class="card-header">
+                        <h3>历史分析记录</h3>
+                        <div class="header-actions">
+                            <select id="historyFilter" onchange="loadHistory()">
+                                <option value="all">全部</option>
+                                <option value="selection">选股记录</option>
+                                <option value="portfolio">持仓分析</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="card-body">
+                        <div id="historyList">
+                            <div class="empty-state">
+                                <div class="empty-icon">📋</div>
+                                <p>暂无历史记录</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 历史详情弹窗 -->
+                <div class="modal" id="historyModal">
+                    <div class="modal-overlay" onclick="closeModal()"></div>
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h3 id="modalTitle">详情</h3>
+                            <button class="modal-close" onclick="closeModal()">✕</button>
+                        </div>
+                        <div class="modal-body" id="modalBody"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
