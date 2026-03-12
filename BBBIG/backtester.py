@@ -10,6 +10,18 @@ import time
 import random
 import json
 import re
+import numpy as np
+
+class _JsonEncoder(json.JSONEncoder):
+    """处理 numpy bool/int/float 的 JSON 序列化"""
+    def default(self, obj):
+        if isinstance(obj, (np.bool_,)):
+            return bool(obj)
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        return super().default(obj)
 import pandas as pd
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -448,7 +460,7 @@ def run_backtest(weeks_list: list = None) -> dict:
     fpath = os.path.join(RESULT_DIR, f"backtest_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
     try:
         with open(fpath, 'w', encoding='utf-8') as f:
-            json.dump(report, f, ensure_ascii=False, indent=2)
+            json.dump(report, f, ensure_ascii=False, indent=2, cls=_JsonEncoder)
         logger.info(f"回测结果已保存至: {fpath}")
     except Exception as e:
         logger.error(f"保存回测结果异常: {e}")
@@ -698,7 +710,7 @@ K线数据:
     fpath = os.path.join(RESULT_DIR, f"backtest_ranked_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
     try:
         with open(fpath, 'w', encoding='utf-8') as f:
-            json.dump(report, f, ensure_ascii=False, indent=2)
+            json.dump(report, f, ensure_ascii=False, indent=2, cls=_JsonEncoder)
         logger.info(f"回测排序结果已保存至: {fpath}")
     except Exception as e:
         logger.error(f"保存回测排序结果异常: {e}")
