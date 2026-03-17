@@ -11,7 +11,8 @@ BBBIG 主入口
   python -m BBBIG.main list            # 查看持仓列表
   python -m BBBIG.main serve           # 启动每日定时调度器
   python -m BBBIG.main web [端口]      # 启动 Web 可视化界面（默认端口 9999）
-  python -m BBBIG.main backtest [1,2,3]  # 回测验证（往前推N周选股并验证盈亏）
+  python -m BBBIG.main backtest [1,2,3]  # AI回测验证（往前推N周选股并验证盈亏）
+  python -m BBBIG.main qbacktest [1,2,3,4]  # 纯量化回测（不调AI，快速验证因子效果）
 """
 import sys
 import os
@@ -173,7 +174,8 @@ BBBIG - A股智能选股与持仓分析系统
   list                查看持仓列表
   serve               启动每日定时调度器（每天18:00自动执行）
   web [端口]           启动 Web 可视化界面（默认端口 9999）
-  backtest [1,2,3]    回测验证（往前推N周选股并用真实K线验证盈亏）
+  backtest [1,2,3]    AI回测验证（往前推N周选股并用真实K线验证盈亏）
+  qbacktest [1,2,3,4] 纯量化回测（不调AI，快速验证多因子评分效果）
 
 示例:
   python -m BBBIG.main select
@@ -207,6 +209,7 @@ def main():
         "serve": lambda: cmd_serve(),
         "web": lambda: cmd_web(args),
         "backtest": lambda: cmd_backtest(args),
+        "qbacktest": lambda: cmd_qbacktest(args),
     }
 
     if command in commands:
