@@ -7,9 +7,12 @@ import os
 import json
 
 # DeepSeek API 配置
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "sk-0aaf455de58046a7bcafcf7de6d22dc9")
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "***")
 DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+
+# Tushare Pro 配置
+TUSHARE_TOKEN = os.environ.get("TUSHARE_TOKEN", "***")
 
 # 数据目录
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))

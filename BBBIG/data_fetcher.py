@@ -1,77 +1,62 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-数据获取模块 - 独立实现，不依赖 instock 模块
-从东方财富获取A股实时行情和历史K线数据
+数据获取模块 - 基于 Tushare Pro
+获取A股实时行情、历史K线、板块资金流向数据
 """
 import time
-import random
-import math
 import logging
-import requests
+import tushare as ts
 import pandas as pd
 from datetime import datetime, timedelta
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+
+from BBBIG.config import TUSHARE_TOKEN
 
 logger = logging.getLogger("BBBIG")
 
 
 class StockDataFetcher:
-    """A股数据获取器"""
+    """A股数据获取器 (Tushare Pro)"""
 
     def __init__(self):
-        self.session = requests.Session()
-        retry = Retry(total=3, backoff_factor=0.3, status_forcelist=[500, 502, 503, 504])
-        adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=retry)
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
-        self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        })
-        self._code_id_map = None
+        ts.set_token(TUSHARE_TOKEN)
+        self.pro = ts.pro_api()
+        self._stock_basic_cache = None
+        self._stock_basic_cache_time = None
+        self._cache_ttl = 3600  # 缓存1小时
 
-    def _get_code_id_map(self) -> dict:
-        """获取股票代码与市场ID映射"""
-        if self._code_id_map is not None:
-            return self._code_id_map
+    def _get_stock_basic(self) -> pd.DataFrame:
+        """获取股票基础信息（带缓存）"""
+        now = time.time()
+        if (self._stock_basic_cache is not None
+                and self._stock_basic_cache_time
+                and now - self._stock_basic_cache_time < self._cache_ttl):
+            return self._stock_basic_cache
 
-        code_id_dict = {}
-        # 上证
-        for fs, market_id in [("m:1 t:2,m:1 t:23", 1), ("m:0 t:6,m:0 t:80", 0), ("m:0 t:81 s:2048", 0)]:
-            page_size = 50
-            page_current = 1
-            url = "http://80.push2.eastmoney.com/api/qt/clist/get"
-            params = {
-                "pn": page_current, "pz": page_size, "po": "1", "np": "1",
-                "ut": "bd1d9ddb04089700cf9c27f6f7426281", "fltt": "2", "invt": "2",
-                "fid": "f12", "fs": fs, "fields": "f12", "_": "1623833739532",
-            }
-            try:
-                r = self.session.get(url, params=params, timeout=15)
-                data_json = r.json()
-                data = data_json.get("data", {}).get("diff", [])
-                if not data:
-                    continue
-                data_count = data_json["data"]["total"]
-                page_count = math.ceil(data_count / page_size)
-                while page_count > 1:
-                    time.sleep(random.uniform(0.3, 0.8))
-                    page_current += 1
-                    params["pn"] = page_current
-                    r = self.session.get(url, params=params, timeout=15)
-                    _data = r.json().get("data", {}).get("diff", [])
-                    if _data:
-                        data.extend(_data)
-                    page_count -= 1
-                for item in data:
-                    code_id_dict[item["f12"]] = market_id
-            except Exception as e:
-                logger.warning(f"获取股票代码映射异常: {e}")
+        try:
+            df = self.pro.stock_basic(
+                exchange='', list_status='L',
+                fields='ts_code,symbol,name,area,industry,market,list_date'
+            )
+            self._stock_basic_cache = df
+            self._stock_basic_cache_time = now
+            return df
+        except Exception as e:
+            logger.error(f"获取股票基础信息异常: {e}")
+            return pd.DataFrame()
 
-        self._code_id_map = code_id_dict
-        return code_id_dict
+    @staticmethod
+    def _ts_code_to_symbol(ts_code: str) -> str:
+        """000001.SZ -> 000001"""
+        return ts_code.split('.')[0] if '.' in ts_code else ts_code
+
+    @staticmethod
+    def _symbol_to_ts_code(symbol: str) -> str:
+        """000001 -> 000001.SZ"""
+        if symbol.startswith(('6',)):
+            return f"{symbol}.SH"
+        else:
+            return f"{symbol}.SZ"
 
     @staticmethod
     def is_a_stock(code: str) -> bool:
@@ -79,181 +64,381 @@ class StockDataFetcher:
         return code.startswith(('600', '601', '603', '605', '000', '001', '002', '003', '300', '301'))
 
     def fetch_all_stocks(self) -> pd.DataFrame:
-        """获取全部A股实时行情"""
-        url = "http://82.push2.eastmoney.com/api/qt/clist/get"
-        page_size = 50
-        page_current = 1
-        params = {
-            "pn": page_current, "pz": page_size, "po": "1", "np": "1",
-            "ut": "bd1d9ddb04089700cf9c27f6f7426281", "fltt": "2", "invt": "2",
-            "fid": "f12",
-            "fs": "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048",
-            "fields": "f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f14,f15,f16,f17,f18,f20,f21,f23,f24,f25,f100,f112,f113",
-            "_": "1623833739532",
-        }
-        all_data = []
+        """
+        获取全部A股实时行情
+        返回列: 最新价, 涨跌幅, 涨跌额, 成交量, 成交额, 振幅, 换手率,
+                市盈率动, 量比, 代码, 名称, 最高, 最低, 今开, 昨收,
+                总市值, 流通市值, 市净率, 60日涨跌幅, 年初至今涨跌幅,
+                所处行业, 每股收益, 每股净资产
+        """
         try:
-            r = self.session.get(url, params=params, timeout=15)
-            data_json = r.json()
-            data = data_json["data"]["diff"]
-            if not data:
+            # 获取最近交易日
+            trade_date = self._get_latest_trade_date()
+            if not trade_date:
                 return pd.DataFrame()
-            all_data.extend(data)
-            data_count = data_json["data"]["total"]
-            page_count = math.ceil(data_count / page_size)
-            while page_count > 1:
-                time.sleep(random.uniform(0.5, 1.0))
-                page_current += 1
-                params["pn"] = page_current
-                r = self.session.get(url, params=params, timeout=15)
-                _data = r.json()["data"]["diff"]
-                all_data.extend(_data)
-                page_count -= 1
+
+            logger.info(f"获取 {trade_date} 全市场行情...")
+
+            # 日行情
+            daily_df = self.pro.daily(trade_date=trade_date)
+            if daily_df is None or daily_df.empty:
+                return pd.DataFrame()
+            time.sleep(0.3)
+
+            # 每日指标（换手率、市盈率、市净率、市值等）
+            basic_df = self.pro.daily_basic(
+                trade_date=trade_date,
+                fields='ts_code,turnover_rate,pe_ttm,pb,ps_ttm,total_mv,circ_mv,volume_ratio'
+            )
+            time.sleep(0.3)
+
+            # 股票基础信息（行业、名称）
+            stock_basic = self._get_stock_basic()
+
+            # 合并数据
+            df = daily_df.merge(basic_df, on='ts_code', how='left', suffixes=('', '_basic'))
+            df = df.merge(
+                stock_basic[['ts_code', 'name', 'industry']],
+                on='ts_code', how='left'
+            )
+
+            # 计算60日涨跌幅
+            df['60日涨跌幅'] = 0.0
+            df['年初至今涨跌幅'] = 0.0
+
+            # 尝试获取60日涨跌幅（通过stk_factor或计算）
+            try:
+                # 获取60日前的日期
+                date_60 = (datetime.strptime(trade_date, '%Y%m%d') - timedelta(days=90)).strftime('%Y%m%d')
+                # 批量获取比较复杂，先设为0，后续有需要再优化
+            except Exception:
+                pass
+
+            # 估算每股收益和每股净资产
+            df['每股收益'] = 0.0
+            df['每股净资产'] = 0.0
+            if 'pe_ttm' in df.columns and 'close' in df.columns:
+                df['每股收益'] = df.apply(
+                    lambda r: r['close'] / r['pe_ttm'] if r['pe_ttm'] and r['pe_ttm'] != 0 else 0,
+                    axis=1
+                )
+            if 'pb' in df.columns and 'close' in df.columns:
+                df['每股净资产'] = df.apply(
+                    lambda r: r['close'] / r['pb'] if r['pb'] and r['pb'] != 0 else 0,
+                    axis=1
+                )
+
+            # 转换代码格式
+            df['代码'] = df['ts_code'].apply(self._ts_code_to_symbol)
+
+            # 重命名列以匹配原接口
+            result = pd.DataFrame()
+            result['最新价'] = pd.to_numeric(df['close'], errors='coerce')
+            result['涨跌幅'] = pd.to_numeric(df['pct_chg'], errors='coerce')
+            result['涨跌额'] = pd.to_numeric(df['change'], errors='coerce')
+            result['成交量'] = pd.to_numeric(df['vol'], errors='coerce') * 100  # tushare单位是手，转为股
+            result['成交额'] = pd.to_numeric(df['amount'], errors='coerce') * 1000  # tushare单位是千元，转为元
+            result['振幅'] = pd.to_numeric(df.get('pct_chg', 0), errors='coerce')  # 近似
+            # 计算振幅 = (最高-最低)/昨收*100
+            if 'high' in df.columns and 'low' in df.columns and 'pre_close' in df.columns:
+                result['振幅'] = ((df['high'] - df['low']) / df['pre_close'] * 100).round(2)
+            result['换手率'] = pd.to_numeric(df.get('turnover_rate', 0), errors='coerce')
+            result['市盈率动'] = pd.to_numeric(df.get('pe_ttm', 0), errors='coerce')
+            result['量比'] = pd.to_numeric(df.get('volume_ratio', 0), errors='coerce')
+            result['代码'] = df['代码']
+            result['名称'] = df['name']
+            result['最高'] = pd.to_numeric(df['high'], errors='coerce')
+            result['最低'] = pd.to_numeric(df['low'], errors='coerce')
+            result['今开'] = pd.to_numeric(df['open'], errors='coerce')
+            result['昨收'] = pd.to_numeric(df['pre_close'], errors='coerce')
+            result['总市值'] = pd.to_numeric(df.get('total_mv', 0), errors='coerce') * 10000  # 万元转元
+            result['流通市值'] = pd.to_numeric(df.get('circ_mv', 0), errors='coerce') * 10000
+            result['市净率'] = pd.to_numeric(df.get('pb', 0), errors='coerce')
+            result['60日涨跌幅'] = df['60日涨跌幅']
+            result['年初至今涨跌幅'] = df['年初至今涨跌幅']
+            result['所处行业'] = df['industry'].fillna('')
+            result['每股收益'] = df['每股收益'].round(4)
+            result['每股净资产'] = df['每股净资产'].round(4)
+
+            # 过滤A股 + 有价格
+            result = result[result['代码'].apply(self.is_a_stock)]
+            result = result[result['最新价'].notna() & (result['最新价'] > 0)]
+            # 过滤ST
+            result = result[~result['名称'].str.contains('ST', na=False)]
+            result = result.reset_index(drop=True)
+
+            logger.info(f"共获取 {len(result)} 只A股行情")
+            return result
+
         except Exception as e:
             logger.error(f"获取全部A股行情异常: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return pd.DataFrame()
-
-        df = pd.DataFrame(all_data)
-        df.columns = [
-            "最新价", "涨跌幅", "涨跌额", "成交量", "成交额", "振幅", "换手率",
-            "市盈率动", "量比", "代码", "名称", "最高", "最低", "今开", "昨收",
-            "总市值", "流通市值", "市净率", "60日涨跌幅", "年初至今涨跌幅",
-            "所处行业", "每股收益", "每股净资产"
-        ]
-        # 类型转换
-        numeric_cols = ["最新价", "涨跌幅", "涨跌额", "成交量", "成交额", "振幅",
-                        "换手率", "市盈率动", "量比", "最高", "最低", "今开", "昨收",
-                        "总市值", "流通市值", "市净率", "60日涨跌幅", "年初至今涨跌幅",
-                        "每股收益", "每股净资产"]
-        for col in numeric_cols:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        # 过滤A股 + 有价格的
-        df = df[df["代码"].apply(self.is_a_stock)]
-        df = df[df["最新价"].notna() & (df["最新价"] > 0)]
-        # 过滤ST
-        df = df[~df["名称"].str.contains("ST", na=False)]
-        df = df.reset_index(drop=True)
-        return df
 
     def fetch_stock_kline(self, code: str, days: int = 30, adjust: str = "qfq",
                           end_date_str: str = None) -> pd.DataFrame:
         """
         获取个股日K线数据
-        :param code: 股票代码
+        :param code: 股票代码（如 000001）
         :param days: 获取天数
         :param adjust: qfq-前复权, hfq-后复权, 空-不复权
-        :param end_date_str: 结束日期，格式 YYYYMMDD，默认为当天
+        :param end_date_str: 结束日期，格式 YYYYMMDD，默认为最近交易日
+        返回列: 日期, 开盘, 收盘, 最高, 最低, 成交量, 成交额, 振幅, 涨跌幅, 涨跌额, 换手率
         """
-        code_id_dict = self._get_code_id_map()
-        if code not in code_id_dict:
-            logger.warning(f"未找到股票代码: {code}")
-            return pd.DataFrame()
-
-        adjust_dict = {"qfq": "1", "hfq": "2", "": "0"}
-        if end_date_str:
-            ref_date = datetime.strptime(end_date_str, "%Y%m%d")
-        else:
-            ref_date = datetime.now()
-        start_date = (ref_date - timedelta(days=days + 15)).strftime("%Y%m%d")
-        end_date = ref_date.strftime("%Y%m%d")
-
-        url = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
-        params = {
-            "fields1": "f1,f2,f3,f4,f5,f6",
-            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f116",
-            "ut": "7eea3edcaed734bea9cbfc24409ed989",
-            "klt": "101",
-            "fqt": adjust_dict.get(adjust, "1"),
-            "secid": f"{code_id_dict[code]}.{code}",
-            "beg": start_date,
-            "end": end_date,
-            "_": "1623766962675",
-        }
         try:
-            r = self.session.get(url, params=params, timeout=15)
-            data_json = r.json()
-            if not (data_json.get("data") and data_json["data"].get("klines")):
+            ts_code = self._symbol_to_ts_code(code)
+
+            if end_date_str:
+                end_date = end_date_str
+            else:
+                end_date = self._get_latest_trade_date()
+                if not end_date:
+                    end_date = datetime.now().strftime('%Y%m%d')
+
+            # 多取一些交易日数据以确保够用
+            start_date = (datetime.strptime(end_date, '%Y%m%d') - timedelta(days=int(days * 1.8) + 30)).strftime('%Y%m%d')
+
+            # 使用 ts.pro_bar 获取复权数据
+            adj_map = {"qfq": "qfq", "hfq": "hfq", "": None}
+            adj = adj_map.get(adjust, "qfq")
+
+            df = ts.pro_bar(
+                ts_code=ts_code,
+                start_date=start_date,
+                end_date=end_date,
+                adj=adj,
+                factors=['tor']  # 换手率
+            )
+
+            if df is None or df.empty:
+                logger.warning(f"未获取到 {code} 的K线数据")
                 return pd.DataFrame()
 
-            df = pd.DataFrame([item.split(",") for item in data_json["data"]["klines"]])
-            df.columns = ["日期", "开盘", "收盘", "最高", "最低", "成交量", "成交额",
-                          "振幅", "涨跌幅", "涨跌额", "换手率"]
-            for col in ["开盘", "收盘", "最高", "最低", "成交量", "成交额", "振幅", "涨跌幅", "涨跌额", "换手率"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
+            # 按日期升序排列
+            df = df.sort_values('trade_date').reset_index(drop=True)
+
+            # 计算振幅
+            df['振幅'] = ((df['high'] - df['low']) / df['pre_close'] * 100).round(2)
+
+            # 构建结果 DataFrame
+            result = pd.DataFrame()
+            result['日期'] = df['trade_date'].apply(lambda x: f"{x[:4]}-{x[4:6]}-{x[6:8]}")
+            result['开盘'] = pd.to_numeric(df['open'], errors='coerce')
+            result['收盘'] = pd.to_numeric(df['close'], errors='coerce')
+            result['最高'] = pd.to_numeric(df['high'], errors='coerce')
+            result['最低'] = pd.to_numeric(df['low'], errors='coerce')
+            result['成交量'] = pd.to_numeric(df['vol'], errors='coerce') * 100  # 手转股
+            result['成交额'] = pd.to_numeric(df['amount'], errors='coerce') * 1000  # 千元转元
+            result['振幅'] = df['振幅']
+            result['涨跌幅'] = pd.to_numeric(df['pct_chg'], errors='coerce')
+            result['涨跌额'] = pd.to_numeric(df['change'], errors='coerce')
+            result['换手率'] = pd.to_numeric(df.get('tor', pd.Series([0]*len(df))), errors='coerce').fillna(0)
+
             # 只取最近 days 个交易日
-            df = df.tail(days).reset_index(drop=True)
-            return df
+            result = result.tail(days).reset_index(drop=True)
+            return result
+
         except Exception as e:
             logger.error(f"获取{code}K线异常: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return pd.DataFrame()
 
     def fetch_hot_sectors(self) -> pd.DataFrame:
-        """获取行业板块资金流向（用于热点分析）"""
-        url = "http://push2.eastmoney.com/api/qt/clist/get"
-        params = {
-            "pn": "1", "pz": "100", "po": "1", "np": "1",
-            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-            "fltt": "2", "invt": "2", "fid": "f62",
-            "fs": "m:90 t:2",
-            "fields": "f12,f14,f2,f3,f62,f184,f66,f69,f72,f75,f78,f81,f84,f87,f204,f205,f124",
-            "_": "1623833739532",
-        }
+        """
+        获取行业板块资金流向
+        返回列: 板块名称, 涨跌幅, 主力净流入, 主力净流入占比
+        """
         try:
-            r = self.session.get(url, params=params, timeout=15)
-            data_json = r.json()
-            data = data_json.get("data", {}).get("diff", [])
-            if not data:
+            trade_date = self._get_latest_trade_date()
+            if not trade_date:
                 return pd.DataFrame()
 
-            df = pd.DataFrame(data)
-            df.columns = [
-                "板块代码", "板块名称", "最新价", "涨跌幅", "主力净流入",
-                "主力净流入占比", "超大单净流入", "超大单净流入占比",
-                "大单净流入", "大单净流入占比", "中单净流入", "中单净流入占比",
-                "小单净流入", "小单净流入占比", "主力净流入最大股", "主力净流入最大股代码", "_"
-            ]
-            numeric_cols = ["最新价", "涨跌幅", "主力净流入", "主力净流入占比"]
-            for col in numeric_cols:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            df = df.sort_values("主力净流入", ascending=False).head(20)
-            return df[["板块名称", "涨跌幅", "主力净流入", "主力净流入占比"]].reset_index(drop=True)
+            # 获取行业资金流向
+            df = self.pro.moneyflow_ind(trade_date=trade_date)
+            time.sleep(0.3)
+
+            if df is None or df.empty:
+                # 降级方案：通过行业分组计算
+                return self._calc_sector_stats_by_industry(trade_date)
+
+            # 主力净流入 = 超大单 + 大单
+            df['主力净流入'] = (df['super_net_inflow'] + df['big_net_inflow']) * 10000  # 万元转元
+            total_flow = df['buy_elg_amount'] + df['buy_lg_amount'] + df['sell_elg_amount'] + df['sell_lg_amount']
+            df['主力净流入占比'] = (df['主力净流入'] / (total_flow * 10000).replace(0, float('nan')) * 100).round(2)
+
+            # 用行业代码获取行业名称
+            industry_map = self._get_industry_name_map()
+            df['板块名称'] = df['industry'].map(industry_map).fillna(df['industry'])
+
+            # 获取行业涨跌幅（通过当日行业个股平均涨跌幅）
+            df['涨跌幅'] = 0.0
+            try:
+                daily_df = self.pro.daily(trade_date=trade_date, fields='ts_code,pct_chg')
+                stock_basic = self._get_stock_basic()
+                if daily_df is not None and not daily_df.empty:
+                    merged = daily_df.merge(stock_basic[['ts_code', 'industry']], on='ts_code', how='left')
+                    industry_chg = merged.groupby('industry')['pct_chg'].mean().reset_index()
+                    industry_chg.columns = ['industry', '涨跌幅']
+                    df = df.merge(industry_chg, on='industry', how='left', suffixes=('_old', ''))
+                    if '涨跌幅_old' in df.columns:
+                        df.drop(columns=['涨跌幅_old'], inplace=True)
+            except Exception:
+                pass
+
+            df = df.sort_values('主力净流入', ascending=False).head(20)
+            return df[['板块名称', '涨跌幅', '主力净流入', '主力净流入占比']].reset_index(drop=True)
+
         except Exception as e:
             logger.error(f"获取行业板块资金流异常: {e}")
+            # 降级方案
+            try:
+                trade_date = self._get_latest_trade_date()
+                if trade_date:
+                    return self._calc_sector_stats_by_industry(trade_date)
+            except Exception:
+                pass
             return pd.DataFrame()
 
     def fetch_concept_sectors(self) -> pd.DataFrame:
-        """获取概念板块资金流向（用于热点分析）"""
-        url = "http://push2.eastmoney.com/api/qt/clist/get"
-        params = {
-            "pn": "1", "pz": "100", "po": "1", "np": "1",
-            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-            "fltt": "2", "invt": "2", "fid": "f62",
-            "fs": "m:90 t:3",
-            "fields": "f12,f14,f2,f3,f62,f184,f66,f69,f72,f75,f78,f81,f84,f87,f204,f205,f124",
-            "_": "1623833739532",
-        }
+        """
+        获取概念板块资金流向
+        返回列: 板块名称, 涨跌幅, 主力净流入, 主力净流入占比
+        """
         try:
-            r = self.session.get(url, params=params, timeout=15)
-            data_json = r.json()
-            data = data_json.get("data", {}).get("diff", [])
-            if not data:
+            trade_date = self._get_latest_trade_date()
+            if not trade_date:
                 return pd.DataFrame()
 
-            df = pd.DataFrame(data)
-            df.columns = [
-                "板块代码", "板块名称", "最新价", "涨跌幅", "主力净流入",
-                "主力净流入占比", "超大单净流入", "超大单净流入占比",
-                "大单净流入", "大单净流入占比", "中单净流入", "中单净流入占比",
-                "小单净流入", "小单净流入占比", "主力净流入最大股", "主力净流入最大股代码", "_"
-            ]
-            numeric_cols = ["最新价", "涨跌幅", "主力净流入", "主力净流入占比"]
-            for col in numeric_cols:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            df = df.sort_values("主力净流入", ascending=False).head(20)
-            return df[["板块名称", "涨跌幅", "主力净流入", "主力净流入占比"]].reset_index(drop=True)
+            # 获取概念板块列表
+            concepts = self.pro.concept()
+            time.sleep(0.3)
+
+            if concepts is None or concepts.empty:
+                return pd.DataFrame()
+
+            # 获取当日行情
+            daily_df = self.pro.daily(trade_date=trade_date, fields='ts_code,pct_chg,amount')
+            time.sleep(0.3)
+
+            if daily_df is None or daily_df.empty:
+                return pd.DataFrame()
+
+            # 获取资金流向数据
+            moneyflow_df = None
+            try:
+                moneyflow_df = self.pro.moneyflow(trade_date=trade_date)
+                time.sleep(0.3)
+            except Exception:
+                pass
+
+            results = []
+            # 只分析前30个概念板块（避免接口限流）
+            for _, concept in concepts.head(30).iterrows():
+                try:
+                    time.sleep(0.5)  # 避免限流
+                    detail = self.pro.concept_detail(id=concept['code'], fields='ts_code')
+                    if detail is None or detail.empty:
+                        continue
+
+                    codes = detail['ts_code'].tolist()
+                    sector_daily = daily_df[daily_df['ts_code'].isin(codes)]
+
+                    if sector_daily.empty:
+                        continue
+
+                    avg_chg = sector_daily['pct_chg'].mean()
+                    total_amount = sector_daily['amount'].sum() * 1000  # 千元转元
+
+                    # 如果有资金流向数据
+                    net_inflow = 0.0
+                    net_inflow_pct = 0.0
+                    if moneyflow_df is not None and not moneyflow_df.empty:
+                        sector_flow = moneyflow_df[moneyflow_df['ts_code'].isin(codes)]
+                        if not sector_flow.empty:
+                            if 'net_mf_amount' in sector_flow.columns:
+                                net_inflow = sector_flow['net_mf_amount'].sum() * 10000
+                            elif 'buy_elg_amount' in sector_flow.columns:
+                                net_inflow = ((sector_flow['buy_elg_amount'] + sector_flow['buy_lg_amount']
+                                               - sector_flow['sell_elg_amount'] - sector_flow['sell_lg_amount']).sum() * 10000)
+                            if total_amount > 0:
+                                net_inflow_pct = round(net_inflow / total_amount * 100, 2)
+
+                    results.append({
+                        '板块名称': concept['name'],
+                        '涨跌幅': round(avg_chg, 2),
+                        '主力净流入': net_inflow,
+                        '主力净流入占比': net_inflow_pct,
+                    })
+                except Exception as e:
+                    logger.debug(f"获取概念 {concept.get('name', '')} 详情异常: {e}")
+                    continue
+
+            if not results:
+                return pd.DataFrame()
+
+            df = pd.DataFrame(results)
+            df = df.sort_values('主力净流入', ascending=False).head(20)
+            return df[['板块名称', '涨跌幅', '主力净流入', '主力净流入占比']].reset_index(drop=True)
+
         except Exception as e:
             logger.error(f"获取概念板块资金流异常: {e}")
+            return pd.DataFrame()
+
+    def _get_latest_trade_date(self) -> str:
+        """获取最近交易日"""
+        try:
+            today = datetime.now().strftime('%Y%m%d')
+            cal = self.pro.trade_cal(
+                exchange='SSE',
+                start_date=(datetime.now() - timedelta(days=30)).strftime('%Y%m%d'),
+                end_date=today,
+                is_open='1'
+            )
+            if cal is not None and not cal.empty:
+                return cal['cal_date'].max()
+        except Exception as e:
+            logger.warning(f"获取交易日历异常: {e}")
+
+        # 降级：返回今天
+        return datetime.now().strftime('%Y%m%d')
+
+    def _get_industry_name_map(self) -> dict:
+        """获取行业代码到名称的映射"""
+        stock_basic = self._get_stock_basic()
+        if stock_basic.empty:
+            return {}
+        # tushare的industry字段本身就是中文名称
+        return {ind: ind for ind in stock_basic['industry'].dropna().unique()}
+
+    def _calc_sector_stats_by_industry(self, trade_date: str) -> pd.DataFrame:
+        """通过行业分组计算板块统计（降级方案）"""
+        try:
+            daily_df = self.pro.daily(trade_date=trade_date, fields='ts_code,pct_chg,amount')
+            stock_basic = self._get_stock_basic()
+
+            if daily_df is None or daily_df.empty:
+                return pd.DataFrame()
+
+            merged = daily_df.merge(stock_basic[['ts_code', 'industry']], on='ts_code', how='left')
+            merged = merged.dropna(subset=['industry'])
+
+            stats = merged.groupby('industry').agg(
+                涨跌幅=('pct_chg', 'mean'),
+                成交额=('amount', 'sum')
+            ).reset_index()
+
+            stats['板块名称'] = stats['industry']
+            stats['主力净流入'] = 0.0
+            stats['主力净流入占比'] = 0.0
+            stats['涨跌幅'] = stats['涨跌幅'].round(2)
+
+            stats = stats.sort_values('涨跌幅', ascending=False).head(20)
+            return stats[['板块名称', '涨跌幅', '主力净流入', '主力净流入占比']].reset_index(drop=True)
+
+        except Exception as e:
+            logger.error(f"计算行业统计异常: {e}")
             return pd.DataFrame()
 
 
