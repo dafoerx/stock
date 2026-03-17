@@ -20,6 +20,7 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 PORTFOLIO_FILE = os.path.join(DATA_DIR, "portfolio.json")
 RESULT_DIR = os.path.join(DATA_DIR, "results")
+DB_FILE = os.path.join(DATA_DIR, "stock_data.db")  # SQLite 缓存数据库
 
 # 确保目录存在
 for d in [DATA_DIR, LOG_DIR, RESULT_DIR]:

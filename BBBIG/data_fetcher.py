@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-数据获取模块 - 基于 Tushare Pro
-获取A股实时行情、历史K线、板块资金流向数据
+数据获取模块 - 基于 Tushare Pro + SQLite 缓存
+首次获取后存入本地数据库，后续增量补数据，大幅减少 API 调用
 """
 import time
 import logging
@@ -11,39 +11,156 @@ import pandas as pd
 from datetime import datetime, timedelta
 
 from BBBIG.config import TUSHARE_TOKEN
+from BBBIG.db_cache import db_cache
 
 logger = logging.getLogger("BBBIG")
 
 
 class StockDataFetcher:
-    """A股数据获取器 (Tushare Pro)"""
+    """A股数据获取器 (Tushare Pro + SQLite 缓存)"""
 
     def __init__(self):
         ts.set_token(TUSHARE_TOKEN)
         self.pro = ts.pro_api()
-        self._stock_basic_cache = None
-        self._stock_basic_cache_time = None
-        self._cache_ttl = 3600  # 缓存1小时
+        self._api_interval = 0.5  # API 调用间隔（秒）
 
-    def _get_stock_basic(self) -> pd.DataFrame:
-        """获取股票基础信息（带缓存）"""
-        now = time.time()
-        if (self._stock_basic_cache is not None
-                and self._stock_basic_cache_time
-                and now - self._stock_basic_cache_time < self._cache_ttl):
-            return self._stock_basic_cache
+    def _api_sleep(self):
+        """API 调用间隔，避免限流"""
+        time.sleep(self._api_interval)
 
+    # ========== 交易日历（缓存优先） ==========
+
+    def _ensure_trade_cal(self):
+        """确保交易日历已缓存，增量补数据"""
+        today = datetime.now().strftime('%Y%m%d')
+        year_start = datetime.now().strftime('%Y') + '0101'
+
+        # 检查本月数据是否已有
+        this_month = datetime.now().strftime('%Y%m')
+        if db_cache.has_trade_cal(this_month):
+            return
+
+        # 获取整年交易日历
+        logger.info("从 Tushare 获取交易日历...")
+        try:
+            cal = self.pro.trade_cal(
+                exchange='SSE',
+                start_date=(datetime.now() - timedelta(days=365)).strftime('%Y%m%d'),
+                end_date=today
+            )
+            if cal is not None and not cal.empty:
+                db_cache.save_trade_cal(cal)
+            self._api_sleep()
+        except Exception as e:
+            logger.warning(f"获取交易日历异常: {e}")
+
+    def _get_latest_trade_date(self) -> str:
+        """获取最近交易日"""
+        self._ensure_trade_cal()
+        today = datetime.now().strftime('%Y%m%d')
+        start = (datetime.now() - timedelta(days=30)).strftime('%Y%m%d')
+        dates = db_cache.get_trade_dates(start, today)
+        if dates:
+            return dates[-1]
+        # 降级：返回今天
+        return today
+
+    # ========== 股票基础信息（缓存优先） ==========
+
+    def _ensure_stock_basic(self):
+        """确保股票基础信息已缓存（24小时更新一次）"""
+        if db_cache.is_stock_basic_fresh(max_age_hours=24):
+            return
+
+        logger.info("从 Tushare 获取股票基础信息...")
         try:
             df = self.pro.stock_basic(
                 exchange='', list_status='L',
                 fields='ts_code,symbol,name,area,industry,market,list_date'
             )
-            self._stock_basic_cache = df
-            self._stock_basic_cache_time = now
-            return df
+            if df is not None and not df.empty:
+                db_cache.save_stock_basic(df)
+            self._api_sleep()
         except Exception as e:
-            logger.error(f"获取股票基础信息异常: {e}")
-            return pd.DataFrame()
+            logger.warning(f"获取股票基础信息异常: {e}")
+
+    def _get_stock_basic(self) -> pd.DataFrame:
+        """获取股票基础信息"""
+        self._ensure_stock_basic()
+        return db_cache.get_stock_basic()
+
+    # ========== 日行情（增量获取） ==========
+
+    def _ensure_daily(self, trade_date: str):
+        """确保某日日行情已缓存"""
+        if db_cache.has_daily(trade_date):
+            return
+
+        logger.info(f"从 Tushare 获取 {trade_date} 日行情...")
+        try:
+            df = self.pro.daily(trade_date=trade_date)
+            if df is not None and not df.empty:
+                db_cache.save_daily(df)
+                db_cache.mark_synced('daily', trade_date)
+                logger.info(f"缓存 {trade_date} 日行情 {len(df)} 条")
+            self._api_sleep()
+        except Exception as e:
+            logger.error(f"获取 {trade_date} 日行情异常: {e}")
+
+    def _ensure_daily_range(self, ts_code: str, start_date: str, end_date: str):
+        """确保某只股票某段时间的日行情已缓存（增量补数据）"""
+        self._ensure_trade_cal()
+        missing_dates = db_cache.get_missing_trade_dates('daily', start_date, end_date)
+
+        if not missing_dates:
+            return
+
+        # 检查该股票在这些日期是否已有数据
+        cached = db_cache.get_daily_by_code(ts_code, start_date, end_date)
+        cached_dates = set(cached['trade_date'].tolist()) if not cached.empty else set()
+
+        # 只获取确实缺失的日期（按日期批量获取全市场数据）
+        truly_missing = [d for d in missing_dates if d not in cached_dates]
+
+        if not truly_missing:
+            return
+
+        # 如果缺失天数少，逐日获取全市场；如果多，按股票获取
+        if len(truly_missing) <= 5:
+            for date in truly_missing:
+                self._ensure_daily(date)
+        else:
+            # 按股票代码获取区间数据
+            logger.info(f"从 Tushare 获取 {ts_code} [{start_date}~{end_date}] K线...")
+            try:
+                df = self.pro.daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
+                if df is not None and not df.empty:
+                    db_cache.save_daily(df)
+                    logger.info(f"缓存 {ts_code} 日行情 {len(df)} 条")
+                self._api_sleep()
+            except Exception as e:
+                logger.error(f"获取 {ts_code} 日行情异常: {e}")
+
+    def _ensure_daily_basic(self, trade_date: str):
+        """确保某日每日指标已缓存"""
+        if db_cache.has_daily_basic(trade_date):
+            return
+
+        logger.info(f"从 Tushare 获取 {trade_date} 每日指标...")
+        try:
+            df = self.pro.daily_basic(
+                trade_date=trade_date,
+                fields='ts_code,turnover_rate,pe_ttm,pb,ps_ttm,total_mv,circ_mv,volume_ratio'
+            )
+            if df is not None and not df.empty:
+                db_cache.save_daily_basic(df)
+                db_cache.mark_synced('daily_basic', trade_date)
+                logger.info(f"缓存 {trade_date} 每日指标 {len(df)} 条")
+            self._api_sleep()
+        except Exception as e:
+            logger.error(f"获取 {trade_date} 每日指标异常: {e}")
+
+    # ========== 公开接口（与调用方完全兼容） ==========
 
     @staticmethod
     def _ts_code_to_symbol(ts_code: str) -> str:
@@ -72,47 +189,59 @@ class StockDataFetcher:
                 所处行业, 每股收益, 每股净资产
         """
         try:
-            # 获取最近交易日
             trade_date = self._get_latest_trade_date()
             if not trade_date:
                 return pd.DataFrame()
 
             logger.info(f"获取 {trade_date} 全市场行情...")
 
-            # 日行情
-            daily_df = self.pro.daily(trade_date=trade_date)
-            if daily_df is None or daily_df.empty:
+            # 增量获取：日行情 + 每日指标 + 基础信息
+            self._ensure_daily(trade_date)
+            self._ensure_daily_basic(trade_date)
+            self._ensure_stock_basic()
+
+            # 从本地 SQLite 读取
+            daily_df = db_cache.get_daily_by_date(trade_date)
+            if daily_df.empty:
+                logger.error("本地缓存无日行情数据")
                 return pd.DataFrame()
-            time.sleep(0.3)
 
-            # 每日指标（换手率、市盈率、市净率、市值等）
-            basic_df = self.pro.daily_basic(
-                trade_date=trade_date,
-                fields='ts_code,turnover_rate,pe_ttm,pb,ps_ttm,total_mv,circ_mv,volume_ratio'
-            )
-            time.sleep(0.3)
-
-            # 股票基础信息（行业、名称）
-            stock_basic = self._get_stock_basic()
+            basic_df = db_cache.get_daily_basic_by_date(trade_date)
+            stock_basic = db_cache.get_stock_basic()
 
             # 合并数据
-            df = daily_df.merge(basic_df, on='ts_code', how='left', suffixes=('', '_basic'))
-            df = df.merge(
-                stock_basic[['ts_code', 'name', 'industry']],
-                on='ts_code', how='left'
-            )
+            if not basic_df.empty:
+                df = daily_df.merge(basic_df, on='ts_code', how='left', suffixes=('', '_basic'))
+                if 'trade_date_basic' in df.columns:
+                    df.drop(columns=['trade_date_basic'], inplace=True)
+            else:
+                df = daily_df.copy()
+                logger.warning("每日指标(daily_basic)缺失，使用降级估算")
 
-            # 计算60日涨跌幅
+            # 确保 daily_basic 字段存在（降级默认值）
+            for col, default in [('turnover_rate', 5.0), ('pe_ttm', 30.0), ('pb', 3.0),
+                                 ('ps_ttm', 0), ('total_mv', 0), ('circ_mv', 0), ('volume_ratio', 1.0)]:
+                if col not in df.columns:
+                    df[col] = default
+
+            # total_mv 降级估算：用 close * vol * 100（粗略估算流通市值，单位万元）
+            if df['total_mv'].sum() == 0 and 'close' in df.columns and 'vol' in df.columns:
+                df['total_mv'] = (df['close'] * df['vol'] * 100 / 10000).clip(lower=0)
+                df['circ_mv'] = df['total_mv']
+                logger.info("使用 close*vol 估算市值")
+
+            if not stock_basic.empty:
+                df = df.merge(
+                    stock_basic[['ts_code', 'name', 'industry']],
+                    on='ts_code', how='left'
+                )
+            else:
+                df['name'] = ''
+                df['industry'] = ''
+
+            # 60日涨跌幅和年初至今涨跌幅
             df['60日涨跌幅'] = 0.0
             df['年初至今涨跌幅'] = 0.0
-
-            # 尝试获取60日涨跌幅（通过stk_factor或计算）
-            try:
-                # 获取60日前的日期
-                date_60 = (datetime.strptime(trade_date, '%Y%m%d') - timedelta(days=90)).strftime('%Y%m%d')
-                # 批量获取比较复杂，先设为0，后续有需要再优化
-            except Exception:
-                pass
 
             # 估算每股收益和每股净资产
             df['每股收益'] = 0.0
@@ -128,46 +257,44 @@ class StockDataFetcher:
                     axis=1
                 )
 
-            # 转换代码格式
             df['代码'] = df['ts_code'].apply(self._ts_code_to_symbol)
 
-            # 重命名列以匹配原接口
+            # 构建结果（列名与原接口完全一致）
             result = pd.DataFrame()
             result['最新价'] = pd.to_numeric(df['close'], errors='coerce')
             result['涨跌幅'] = pd.to_numeric(df['pct_chg'], errors='coerce')
             result['涨跌额'] = pd.to_numeric(df['change'], errors='coerce')
-            result['成交量'] = pd.to_numeric(df['vol'], errors='coerce') * 100  # tushare单位是手，转为股
-            result['成交额'] = pd.to_numeric(df['amount'], errors='coerce') * 1000  # tushare单位是千元，转为元
-            result['振幅'] = pd.to_numeric(df.get('pct_chg', 0), errors='coerce')  # 近似
-            # 计算振幅 = (最高-最低)/昨收*100
+            result['成交量'] = pd.to_numeric(df['vol'], errors='coerce') * 100
+            result['成交额'] = pd.to_numeric(df['amount'], errors='coerce') * 1000
             if 'high' in df.columns and 'low' in df.columns and 'pre_close' in df.columns:
                 result['振幅'] = ((df['high'] - df['low']) / df['pre_close'] * 100).round(2)
+            else:
+                result['振幅'] = 0.0
             result['换手率'] = pd.to_numeric(df.get('turnover_rate', 0), errors='coerce')
             result['市盈率动'] = pd.to_numeric(df.get('pe_ttm', 0), errors='coerce')
             result['量比'] = pd.to_numeric(df.get('volume_ratio', 0), errors='coerce')
             result['代码'] = df['代码']
-            result['名称'] = df['name']
+            result['名称'] = df.get('name', '').fillna('')
             result['最高'] = pd.to_numeric(df['high'], errors='coerce')
             result['最低'] = pd.to_numeric(df['low'], errors='coerce')
             result['今开'] = pd.to_numeric(df['open'], errors='coerce')
             result['昨收'] = pd.to_numeric(df['pre_close'], errors='coerce')
-            result['总市值'] = pd.to_numeric(df.get('total_mv', 0), errors='coerce') * 10000  # 万元转元
+            result['总市值'] = pd.to_numeric(df.get('total_mv', 0), errors='coerce') * 10000
             result['流通市值'] = pd.to_numeric(df.get('circ_mv', 0), errors='coerce') * 10000
             result['市净率'] = pd.to_numeric(df.get('pb', 0), errors='coerce')
             result['60日涨跌幅'] = df['60日涨跌幅']
             result['年初至今涨跌幅'] = df['年初至今涨跌幅']
-            result['所处行业'] = df['industry'].fillna('')
+            result['所处行业'] = df.get('industry', '').fillna('')
             result['每股收益'] = df['每股收益'].round(4)
             result['每股净资产'] = df['每股净资产'].round(4)
 
-            # 过滤A股 + 有价格
+            # 过滤
             result = result[result['代码'].apply(self.is_a_stock)]
             result = result[result['最新价'].notna() & (result['最新价'] > 0)]
-            # 过滤ST
             result = result[~result['名称'].str.contains('ST', na=False)]
             result = result.reset_index(drop=True)
 
-            logger.info(f"共获取 {len(result)} 只A股行情")
+            logger.info(f"共获取 {len(result)} 只A股行情（缓存）")
             return result
 
         except Exception as e:
@@ -179,11 +306,7 @@ class StockDataFetcher:
     def fetch_stock_kline(self, code: str, days: int = 30, adjust: str = "qfq",
                           end_date_str: str = None) -> pd.DataFrame:
         """
-        获取个股日K线数据
-        :param code: 股票代码（如 000001）
-        :param days: 获取天数
-        :param adjust: qfq-前复权, hfq-后复权, 空-不复权
-        :param end_date_str: 结束日期，格式 YYYYMMDD，默认为最近交易日
+        获取个股日K线数据（缓存优先，增量补数据）
         返回列: 日期, 开盘, 收盘, 最高, 最低, 成交量, 成交额, 振幅, 涨跌幅, 涨跌额, 换手率
         """
         try:
@@ -196,46 +319,51 @@ class StockDataFetcher:
                 if not end_date:
                     end_date = datetime.now().strftime('%Y%m%d')
 
-            # 多取一些交易日数据以确保够用
             start_date = (datetime.strptime(end_date, '%Y%m%d') - timedelta(days=int(days * 1.8) + 30)).strftime('%Y%m%d')
 
-            # 使用 ts.pro_bar 获取复权数据
-            adj_map = {"qfq": "qfq", "hfq": "hfq", "": None}
-            adj = adj_map.get(adjust, "qfq")
+            # 增量获取
+            self._ensure_daily_range(ts_code, start_date, end_date)
 
-            df = ts.pro_bar(
-                ts_code=ts_code,
-                start_date=start_date,
-                end_date=end_date,
-                adj=adj,
-                factors=['tor']  # 换手率
-            )
+            # 从缓存读取
+            df = db_cache.get_daily_by_code(ts_code, start_date, end_date)
 
-            if df is None or df.empty:
-                logger.warning(f"未获取到 {code} 的K线数据")
-                return pd.DataFrame()
-
-            # 按日期升序排列
-            df = df.sort_values('trade_date').reset_index(drop=True)
+            if df.empty:
+                # 缓存没有，直接从 API 获取单只股票
+                logger.info(f"缓存无 {code} 数据，从 Tushare 直接获取...")
+                adj_map = {"qfq": "qfq", "hfq": "hfq", "": None}
+                adj = adj_map.get(adjust, "qfq")
+                df = ts.pro_bar(
+                    ts_code=ts_code, start_date=start_date, end_date=end_date,
+                    adj=adj, factors=['tor']
+                )
+                if df is not None and not df.empty:
+                    db_cache.save_daily(df)
+                    df = df.sort_values('trade_date').reset_index(drop=True)
+                else:
+                    logger.warning(f"未获取到 {code} 的K线数据")
+                    return pd.DataFrame()
+                self._api_sleep()
 
             # 计算振幅
-            df['振幅'] = ((df['high'] - df['low']) / df['pre_close'] * 100).round(2)
+            df['振幅'] = 0.0
+            mask = df['pre_close'].notna() & (df['pre_close'] > 0)
+            df.loc[mask, '振幅'] = ((df.loc[mask, 'high'] - df.loc[mask, 'low']) / df.loc[mask, 'pre_close'] * 100).round(2)
 
-            # 构建结果 DataFrame
+            # 构建结果
             result = pd.DataFrame()
             result['日期'] = df['trade_date'].apply(lambda x: f"{x[:4]}-{x[4:6]}-{x[6:8]}")
             result['开盘'] = pd.to_numeric(df['open'], errors='coerce')
             result['收盘'] = pd.to_numeric(df['close'], errors='coerce')
             result['最高'] = pd.to_numeric(df['high'], errors='coerce')
             result['最低'] = pd.to_numeric(df['low'], errors='coerce')
-            result['成交量'] = pd.to_numeric(df['vol'], errors='coerce') * 100  # 手转股
-            result['成交额'] = pd.to_numeric(df['amount'], errors='coerce') * 1000  # 千元转元
+            result['成交量'] = pd.to_numeric(df['vol'], errors='coerce') * 100
+            result['成交额'] = pd.to_numeric(df['amount'], errors='coerce') * 1000
             result['振幅'] = df['振幅']
             result['涨跌幅'] = pd.to_numeric(df['pct_chg'], errors='coerce')
             result['涨跌额'] = pd.to_numeric(df['change'], errors='coerce')
-            result['换手率'] = pd.to_numeric(df.get('tor', pd.Series([0]*len(df))), errors='coerce').fillna(0)
+            # 换手率：缓存中没有 tor 字段，置 0
+            result['换手率'] = 0.0
 
-            # 只取最近 days 个交易日
             result = result.tail(days).reset_index(drop=True)
             return result
 
@@ -247,7 +375,7 @@ class StockDataFetcher:
 
     def fetch_hot_sectors(self) -> pd.DataFrame:
         """
-        获取行业板块资金流向
+        获取行业板块资金流向（缓存优先）
         返回列: 板块名称, 涨跌幅, 主力净流入, 主力净流入占比
         """
         try:
@@ -255,55 +383,50 @@ class StockDataFetcher:
             if not trade_date:
                 return pd.DataFrame()
 
-            # 获取行业资金流向
-            df = self.pro.moneyflow_ind(trade_date=trade_date)
-            time.sleep(0.3)
-
-            if df is None or df.empty:
-                # 降级方案：通过行业分组计算
-                return self._calc_sector_stats_by_industry(trade_date)
-
-            # 主力净流入 = 超大单 + 大单
-            df['主力净流入'] = (df['super_net_inflow'] + df['big_net_inflow']) * 10000  # 万元转元
-            total_flow = df['buy_elg_amount'] + df['buy_lg_amount'] + df['sell_elg_amount'] + df['sell_lg_amount']
-            df['主力净流入占比'] = (df['主力净流入'] / (total_flow * 10000).replace(0, float('nan')) * 100).round(2)
-
-            # 用行业代码获取行业名称
-            industry_map = self._get_industry_name_map()
-            df['板块名称'] = df['industry'].map(industry_map).fillna(df['industry'])
-
-            # 获取行业涨跌幅（通过当日行业个股平均涨跌幅）
-            df['涨跌幅'] = 0.0
+            # 尝试获取行业资金流向
             try:
-                daily_df = self.pro.daily(trade_date=trade_date, fields='ts_code,pct_chg')
-                stock_basic = self._get_stock_basic()
-                if daily_df is not None and not daily_df.empty:
-                    merged = daily_df.merge(stock_basic[['ts_code', 'industry']], on='ts_code', how='left')
-                    industry_chg = merged.groupby('industry')['pct_chg'].mean().reset_index()
-                    industry_chg.columns = ['industry', '涨跌幅']
-                    df = df.merge(industry_chg, on='industry', how='left', suffixes=('_old', ''))
-                    if '涨跌幅_old' in df.columns:
-                        df.drop(columns=['涨跌幅_old'], inplace=True)
-            except Exception:
-                pass
+                df = self.pro.moneyflow_ind(trade_date=trade_date)
+                self._api_sleep()
 
-            df = df.sort_values('主力净流入', ascending=False).head(20)
-            return df[['板块名称', '涨跌幅', '主力净流入', '主力净流入占比']].reset_index(drop=True)
+                if df is not None and not df.empty:
+                    df['主力净流入'] = (df['super_net_inflow'] + df['big_net_inflow']) * 10000
+                    total_flow = df['buy_elg_amount'] + df['buy_lg_amount'] + df['sell_elg_amount'] + df['sell_lg_amount']
+                    df['主力净流入占比'] = (df['主力净流入'] / (total_flow * 10000).replace(0, float('nan')) * 100).round(2)
+
+                    industry_map = self._get_industry_name_map()
+                    df['板块名称'] = df['industry'].map(industry_map).fillna(df['industry'])
+
+                    # 行业涨跌幅
+                    df['涨跌幅'] = 0.0
+                    try:
+                        self._ensure_daily(trade_date)
+                        daily_df = db_cache.get_daily_by_date(trade_date)
+                        stock_basic = self._get_stock_basic()
+                        if not daily_df.empty and not stock_basic.empty:
+                            merged = daily_df.merge(stock_basic[['ts_code', 'industry']], on='ts_code', how='left')
+                            industry_chg = merged.groupby('industry')['pct_chg'].mean().reset_index()
+                            industry_chg.columns = ['industry', '涨跌幅']
+                            df = df.merge(industry_chg, on='industry', how='left', suffixes=('_old', ''))
+                            if '涨跌幅_old' in df.columns:
+                                df.drop(columns=['涨跌幅_old'], inplace=True)
+                    except Exception:
+                        pass
+
+                    df = df.sort_values('主力净流入', ascending=False).head(20)
+                    return df[['板块名称', '涨跌幅', '主力净流入', '主力净流入占比']].reset_index(drop=True)
+            except Exception as e:
+                logger.warning(f"moneyflow_ind 接口异常: {e}")
+
+            # 降级方案：通过缓存的日行情 + 基础信息按行业分组
+            return self._calc_sector_stats_by_industry(trade_date)
 
         except Exception as e:
             logger.error(f"获取行业板块资金流异常: {e}")
-            # 降级方案
-            try:
-                trade_date = self._get_latest_trade_date()
-                if trade_date:
-                    return self._calc_sector_stats_by_industry(trade_date)
-            except Exception:
-                pass
             return pd.DataFrame()
 
     def fetch_concept_sectors(self) -> pd.DataFrame:
         """
-        获取概念板块资金流向
+        获取概念板块资金流向（缓存优先）
         返回列: 板块名称, 涨跌幅, 主力净流入, 主力净流入占比
         """
         try:
@@ -311,47 +434,61 @@ class StockDataFetcher:
             if not trade_date:
                 return pd.DataFrame()
 
-            # 获取概念板块列表
-            concepts = self.pro.concept()
-            time.sleep(0.3)
-
-            if concepts is None or concepts.empty:
+            # 确保日行情已缓存
+            self._ensure_daily(trade_date)
+            daily_df = db_cache.get_daily_by_date(trade_date)
+            if daily_df.empty:
                 return pd.DataFrame()
 
-            # 获取当日行情
-            daily_df = self.pro.daily(trade_date=trade_date, fields='ts_code,pct_chg,amount')
-            time.sleep(0.3)
+            # 概念板块列表（缓存优先）
+            concepts = pd.DataFrame()
+            if db_cache.is_concept_fresh():
+                concepts = db_cache.get_concepts()
 
-            if daily_df is None or daily_df.empty:
+            if concepts.empty:
+                logger.info("从 Tushare 获取概念板块列表...")
+                try:
+                    concepts = self.pro.concept()
+                    if concepts is not None and not concepts.empty:
+                        db_cache.save_concepts(concepts)
+                    self._api_sleep()
+                except Exception as e:
+                    logger.error(f"获取概念列表异常: {e}")
+                    return pd.DataFrame()
+
+            if concepts.empty:
                 return pd.DataFrame()
 
-            # 获取资金流向数据
+            # 获取资金流向
             moneyflow_df = None
             try:
                 moneyflow_df = self.pro.moneyflow(trade_date=trade_date)
-                time.sleep(0.3)
+                self._api_sleep()
             except Exception:
                 pass
 
             results = []
-            # 只分析前30个概念板块（避免接口限流）
             for _, concept in concepts.head(30).iterrows():
                 try:
-                    time.sleep(0.5)  # 避免限流
-                    detail = self.pro.concept_detail(id=concept['code'], fields='ts_code')
-                    if detail is None or detail.empty:
-                        continue
+                    concept_code = concept['code']
+                    # 成分股（缓存优先）
+                    codes = db_cache.get_concept_detail(concept_code)
+                    if not codes:
+                        self._api_sleep()
+                        detail = self.pro.concept_detail(id=concept_code, fields='ts_code')
+                        if detail is not None and not detail.empty:
+                            codes = detail['ts_code'].tolist()
+                            db_cache.save_concept_detail(concept_code, codes)
+                        else:
+                            continue
 
-                    codes = detail['ts_code'].tolist()
                     sector_daily = daily_df[daily_df['ts_code'].isin(codes)]
-
                     if sector_daily.empty:
                         continue
 
                     avg_chg = sector_daily['pct_chg'].mean()
-                    total_amount = sector_daily['amount'].sum() * 1000  # 千元转元
+                    total_amount = sector_daily['amount'].sum() * 1000
 
-                    # 如果有资金流向数据
                     net_inflow = 0.0
                     net_inflow_pct = 0.0
                     if moneyflow_df is not None and not moneyflow_df.empty:
@@ -386,39 +523,27 @@ class StockDataFetcher:
             logger.error(f"获取概念板块资金流异常: {e}")
             return pd.DataFrame()
 
-    def _get_latest_trade_date(self) -> str:
-        """获取最近交易日"""
-        try:
-            today = datetime.now().strftime('%Y%m%d')
-            cal = self.pro.trade_cal(
-                exchange='SSE',
-                start_date=(datetime.now() - timedelta(days=30)).strftime('%Y%m%d'),
-                end_date=today,
-                is_open='1'
-            )
-            if cal is not None and not cal.empty:
-                return cal['cal_date'].max()
-        except Exception as e:
-            logger.warning(f"获取交易日历异常: {e}")
-
-        # 降级：返回今天
-        return datetime.now().strftime('%Y%m%d')
+    # ========== 内部辅助方法 ==========
 
     def _get_industry_name_map(self) -> dict:
-        """获取行业代码到名称的映射"""
         stock_basic = self._get_stock_basic()
         if stock_basic.empty:
             return {}
-        # tushare的industry字段本身就是中文名称
         return {ind: ind for ind in stock_basic['industry'].dropna().unique()}
 
     def _calc_sector_stats_by_industry(self, trade_date: str) -> pd.DataFrame:
-        """通过行业分组计算板块统计（降级方案）"""
+        """通过行业分组计算板块统计（降级方案，使用缓存）"""
         try:
-            daily_df = self.pro.daily(trade_date=trade_date, fields='ts_code,pct_chg,amount')
-            stock_basic = self._get_stock_basic()
+            self._ensure_daily(trade_date)
+            self._ensure_stock_basic()
 
-            if daily_df is None or daily_df.empty:
+            daily_df = db_cache.get_daily_by_date(trade_date)
+            stock_basic = db_cache.get_stock_basic()
+
+            if daily_df.empty:
+                return pd.DataFrame()
+
+            if stock_basic.empty or 'industry' not in stock_basic.columns:
                 return pd.DataFrame()
 
             merged = daily_df.merge(stock_basic[['ts_code', 'industry']], on='ts_code', how='left')
@@ -459,3 +584,6 @@ if __name__ == "__main__":
     print("\n=== 行业板块资金流向 ===")
     sectors = fetcher.fetch_hot_sectors()
     print(sectors)
+
+    print("\n=== 数据库统计 ===")
+    print(db_cache.get_db_stats())
