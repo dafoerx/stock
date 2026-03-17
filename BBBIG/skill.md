@@ -4,8 +4,7 @@
 
 - **名称**: BBBIG
 - **描述**: A股智能选股与持仓分析系统，基于多因子量化模型 + DeepSeek AI 大模型
-- **项目路径**: `/data/dafoer/my_work/stock`
-- **入口**: `python -m BBBIG.main <command>`
+- **入口**: `python -m BBBIG.main <command>`（在项目根目录执行）
 
 ## 能力列表
 
@@ -14,7 +13,7 @@
 **触发**: 用户想了解今天买什么股票 / 推荐股票 / 选股
 
 ```bash
-cd /data/dafoer/my_work/stock && python -m BBBIG.main select
+python -m BBBIG.main select
 ```
 
 **流程**: 大盘风控 → 板块资金流向 → 全量A股行情 → K线技术指标 → 多因子预筛选 TOP80 → AI 5维度评分精选 TOP10 → 回测验证排序
@@ -26,7 +25,7 @@ cd /data/dafoer/my_work/stock && python -m BBBIG.main select
 **触发**: 用户想分析手里的股票 / 该不该卖 / 操作建议
 
 ```bash
-cd /data/dafoer/my_work/stock && python -m BBBIG.main analyze
+python -m BBBIG.main analyze
 ```
 
 **前提**: 需先添加持仓
@@ -38,7 +37,7 @@ cd /data/dafoer/my_work/stock && python -m BBBIG.main analyze
 **触发**: 用户说买了某只股票 / 添加持仓
 
 ```bash
-cd /data/dafoer/my_work/stock && python -m BBBIG.main add <代码> <成本价> [股数] [名称]
+python -m BBBIG.main add <代码> <成本价> [股数] [名称]
 ```
 
 **示例**:
@@ -52,7 +51,7 @@ python -m BBBIG.main add 600519 1700.00 100 贵州茅台
 **触发**: 用户说卖了某只股票 / 移除持仓
 
 ```bash
-cd /data/dafoer/my_work/stock && python -m BBBIG.main remove <代码>
+python -m BBBIG.main remove <代码>
 ```
 
 ### 5. 查看持仓 (list)
@@ -60,7 +59,7 @@ cd /data/dafoer/my_work/stock && python -m BBBIG.main remove <代码>
 **触发**: 用户想看持仓列表
 
 ```bash
-cd /data/dafoer/my_work/stock && python -m BBBIG.main list
+python -m BBBIG.main list
 ```
 
 ### 6. 选股+分析一起执行 (run)
@@ -68,7 +67,7 @@ cd /data/dafoer/my_work/stock && python -m BBBIG.main list
 **触发**: 用户想全面分析 / 选股并分析持仓
 
 ```bash
-cd /data/dafoer/my_work/stock && python -m BBBIG.main run
+python -m BBBIG.main run
 ```
 
 ### 7. AI 回测 (backtest)
@@ -76,7 +75,7 @@ cd /data/dafoer/my_work/stock && python -m BBBIG.main run
 **触发**: 用户想验证选股策略 / 回测
 
 ```bash
-cd /data/dafoer/my_work/stock && python -m BBBIG.main backtest 1,2,3
+python -m BBBIG.main backtest 1,2,3
 ```
 
 参数为回测周数列表（逗号分隔），表示往前推 N 周进行选股并验证
@@ -86,7 +85,7 @@ cd /data/dafoer/my_work/stock && python -m BBBIG.main backtest 1,2,3
 **触发**: 用户想快速验证因子效果 / 不用AI回测
 
 ```bash
-cd /data/dafoer/my_work/stock && python -m BBBIG.main qbacktest 1,2,3,4
+python -m BBBIG.main qbacktest 1,2,3,4
 ```
 
 不调用 AI，直接用多因子评分选股，快速迭代验证
@@ -96,7 +95,7 @@ cd /data/dafoer/my_work/stock && python -m BBBIG.main qbacktest 1,2,3,4
 **触发**: 用户想看可视化界面 / 启动网页
 
 ```bash
-cd /data/dafoer/my_work/stock && python -m BBBIG.main web [端口]
+python -m BBBIG.main web [端口]
 ```
 
 默认端口 9999，访问 http://localhost:9999
@@ -106,7 +105,7 @@ cd /data/dafoer/my_work/stock && python -m BBBIG.main web [端口]
 **触发**: 用户想自动每天执行 / 后台运行
 
 ```bash
-cd /data/dafoer/my_work/stock && python -m BBBIG.main serve
+python -m BBBIG.main serve
 ```
 
 每天 18:00 自动执行选股 + 持仓分析（仅交易日）
