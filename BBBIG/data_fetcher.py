@@ -187,11 +187,18 @@ class StockDataFetcher:
 
     @staticmethod
     def _symbol_to_ts_code(symbol: str) -> str:
-        """000001 -> 000001.SZ"""
-        if symbol.startswith(('6',)):
+        """000001 -> 000001.SZ / 000300(沪深300指数) -> 000300.SH"""
+        # 已含后缀则直接返回
+        if '.' in symbol:
+            return symbol
+        # 上交所知名指数白名单（这些 6 位代码是指数，不是深交所股票）
+        SH_INDEX_CODES = {'000300', '000016', '000905', '000852', '399001', '399006'}
+        if symbol in SH_INDEX_CODES:
             return f"{symbol}.SH"
-        else:
-            return f"{symbol}.SZ"
+        # 普通股票：6开头->上交所，其余->深交所
+        if symbol.startswith('6'):
+            return f"{symbol}.SH"
+        return f"{symbol}.SZ"
 
     @staticmethod
     def is_a_stock(code: str) -> bool:
@@ -321,14 +328,22 @@ class StockDataFetcher:
             logger.error(traceback.format_exc())
             return pd.DataFrame()
 
+    # 指数代码集合（使用 index_daily 接口而非 daily/pro_bar）
+    INDEX_CODES = {'000300', '000016', '000905', '000852', '399001', '399006'}
+
+    def _is_index(self, code: str) -> bool:
+        """判断是否为指数代码"""
+        return code.replace('.SH', '').replace('.SZ', '') in self.INDEX_CODES
+
     def fetch_stock_kline(self, code: str, days: int = 30, adjust: str = "qfq",
                           end_date_str: str = None) -> pd.DataFrame:
         """
-        获取个股日K线数据（缓存优先，增量补数据）
+        获取个股/指数日K线数据（缓存优先，增量补数据）
         返回列: 日期, 开盘, 收盘, 最高, 最低, 成交量, 成交额, 振幅, 涨跌幅, 涨跌额, 换手率
         """
         try:
             ts_code = self._symbol_to_ts_code(code)
+            is_index = self._is_index(code)
 
             if end_date_str:
                 end_date = end_date_str
@@ -339,28 +354,42 @@ class StockDataFetcher:
 
             start_date = (datetime.strptime(end_date, '%Y%m%d') - timedelta(days=int(days * 1.8) + 30)).strftime('%Y%m%d')
 
-            # 增量获取
-            self._ensure_daily_range(ts_code, start_date, end_date)
-
-            # 从缓存读取
-            df = db_cache.get_daily_by_code(ts_code, start_date, end_date)
-
-            if df.empty:
-                # 缓存没有，直接从 API 获取单只股票
-                logger.info(f"缓存无 {code} 数据，从 Tushare 直接获取...")
-                adj_map = {"qfq": "qfq", "hfq": "hfq", "": None}
-                adj = adj_map.get(adjust, "qfq")
-                df = ts.pro_bar(
-                    ts_code=ts_code, start_date=start_date, end_date=end_date,
-                    adj=adj, factors=['tor']
+            if is_index:
+                # 指数直接从 API 获取，不走股票缓存
+                logger.info(f"从 Tushare 获取指数 {ts_code} [{start_date}~{end_date}] K线...")
+                df = self.pro.index_daily(
+                    ts_code=ts_code, start_date=start_date, end_date=end_date
                 )
-                if df is not None and not df.empty:
-                    db_cache.save_daily(df)
-                    df = df.sort_values('trade_date').reset_index(drop=True)
-                else:
-                    logger.warning(f"未获取到 {code} 的K线数据")
+                if df is None or df.empty:
+                    logger.warning(f"未获取到指数 {code} 的K线数据")
                     return pd.DataFrame()
+                df = df.sort_values('trade_date').reset_index(drop=True)
+                # index_daily 没有 pre_close，补充计算
+                df['pre_close'] = df['close'].shift(1)
                 self._api_sleep()
+            else:
+                # 增量获取股票数据
+                self._ensure_daily_range(ts_code, start_date, end_date)
+
+                # 从缓存读取
+                df = db_cache.get_daily_by_code(ts_code, start_date, end_date)
+
+                if df.empty:
+                    # 缓存没有，直接从 API 获取单只股票
+                    logger.info(f"缓存无 {code} 数据，从 Tushare 直接获取...")
+                    adj_map = {"qfq": "qfq", "hfq": "hfq", "": None}
+                    adj = adj_map.get(adjust, "qfq")
+                    df = ts.pro_bar(
+                        ts_code=ts_code, start_date=start_date, end_date=end_date,
+                        adj=adj, factors=['tor']
+                    )
+                    if df is not None and not df.empty:
+                        db_cache.save_daily(df)
+                        df = df.sort_values('trade_date').reset_index(drop=True)
+                    else:
+                        logger.warning(f"未获取到 {code} 的K线数据")
+                        return pd.DataFrame()
+                    self._api_sleep()
 
             # 计算振幅
             df['振幅'] = 0.0
