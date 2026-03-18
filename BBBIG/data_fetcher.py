@@ -55,15 +55,33 @@ class StockDataFetcher:
             logger.warning(f"获取交易日历异常: {e}")
 
     def _get_latest_trade_date(self) -> str:
-        """获取最近交易日"""
+        """获取最近有行情数据的交易日（非未来/未开盘日）"""
         self._ensure_trade_cal()
         today = datetime.now().strftime('%Y%m%d')
+        now_hour = datetime.now().hour
         start = (datetime.now() - timedelta(days=30)).strftime('%Y%m%d')
         dates = db_cache.get_trade_dates(start, today)
-        if dates:
-            return dates[-1]
-        # 降级：返回今天
-        return today
+        if not dates:
+            return today
+        # 如果现在是交易时间前（15:30前）且今天是交易日，用前一交易日
+        # 避免拉取今日尚未生成的数据
+        if len(dates) >= 1:
+            last_date = dates[-1]
+            # 如果最后一个交易日是今天，且现在还没到15:30，则用前一个
+            if last_date == today and now_hour < 16 and len(dates) >= 2:
+                # 优先用缓存里有数据的最近日期
+                for d in reversed(dates[:-1]):
+                    if db_cache.has_daily(d):
+                        return d
+                return dates[-2]
+            # 否则如果今天有缓存，直接用今天
+            if last_date == today and db_cache.has_daily(today):
+                return today
+            # 今天没缓存，找最近有缓存的交易日
+            for d in reversed(dates):
+                if db_cache.has_daily(d):
+                    return d
+        return dates[-1]
 
     # ========== 股票基础信息（缓存优先） ==========
 
