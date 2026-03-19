@@ -171,6 +171,26 @@ def cmd_backtest(args):
     print(format_backtest_report(report))
 
 
+def cmd_simulate(args):
+    """真实资金模拟回测（按周选股+仓位管理+止盈止损）"""
+    from BBBIG.backtest.simulator import run_simulation
+    capital = 30000.0
+    weeks = 4
+    if len(args) >= 1:
+        try:
+            capital = float(args[0])
+        except ValueError:
+            print("用法: python -m BBBIG.main simulate [初始资金] [回测周数]")
+            return
+    if len(args) >= 2:
+        try:
+            weeks = int(args[1])
+        except ValueError:
+            pass
+    print(f"开始策略模拟回测，初始资金={capital:,.0f}元，回测{weeks}周...\n")
+    run_simulation(capital, weeks)
+
+
 def print_usage():
     """打印使用说明"""
     print("""
@@ -191,6 +211,7 @@ BBBIG - A股智能选股与持仓分析系统
   web [端口]           启动 Web 可视化界面（默认端口 9999）
   backtest [1,2,3]    AI回测验证（往前推N周选股并用真实K线验证盈亏）
   qbacktest [1,2,3,4] 纯量化回测（不调AI，快速验证多因子评分效果）
+  simulate [资金] [周数] 真实资金策略模拟（按周选股+仓位管理+止盈止损，默认3万/4周）
 
 示例:
   python -m BBBIG.main select
@@ -225,6 +246,7 @@ def main():
         "web": lambda: cmd_web(args),
         "backtest": lambda: cmd_backtest(args),
         "qbacktest": lambda: cmd_qbacktest(args),
+        "simulate": lambda: cmd_simulate(args),
     }
 
     if command in commands:
