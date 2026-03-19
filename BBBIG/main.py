@@ -46,12 +46,27 @@ def setup_logging():
     )
 
 
+class _SafeEncoder(json.JSONEncoder):
+    """兼容 numpy/pandas bool_、int64、float64 等类型的 JSON 编码器"""
+    def default(self, obj):
+        import numpy as np
+        if isinstance(obj, (np.bool_,)):
+            return bool(obj)
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
+
 def save_result(result: dict, prefix: str):
     """保存结果到JSON文件"""
     date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     filepath = os.path.join(RESULT_DIR, f"{prefix}_{date_str}.json")
     with open(filepath, 'w', encoding='utf-8') as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
+        json.dump(result, f, ensure_ascii=False, indent=2, cls=_SafeEncoder)
     print(f"\n结果已保存至: {filepath}")
 
 
