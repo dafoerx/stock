@@ -40,3 +40,7 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+
+# 回测输出结果
+backtest/results/
+BBBIG/backtest/results/
