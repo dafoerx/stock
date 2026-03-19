@@ -171,6 +171,21 @@ def cmd_backtest(args):
     print(format_backtest_report(report))
 
 
+def cmd_qbacktest(args):
+    """纯量化回测（不调AI，快速验证多因子评分效果）"""
+    from BBBIG.backtester import run_quant_backtest, format_backtest_report
+    weeks_list = [1, 2, 3, 4]
+    if args:
+        try:
+            weeks_list = [int(x) for x in args[0].split(",")]
+        except ValueError:
+            print("用法: python -m BBBIG.main qbacktest [1,2,3,4]")
+            return
+    print(f"开始纯量化回测（往前推 {weeks_list} 周）...\n")
+    report = run_quant_backtest(weeks_list)
+    print(format_backtest_report(report))
+
+
 def cmd_simulate(args):
     """真实资金模拟回测（按周选股+仓位管理+止盈止损）"""
     from BBBIG.backtest.simulator import run_simulation

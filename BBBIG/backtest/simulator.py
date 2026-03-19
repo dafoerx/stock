@@ -224,15 +224,25 @@ class Position:
             return self.proceeds - self.cost_total
         return 0.0
 
+    @property
+    def floating_pnl(self) -> float:
+        """持仓浮动盈亏（未平仓时有效）"""
+        if self.proceeds is None:
+            return round(self.market_value - self.cost_total, 2)
+        return 0.0
+
     def to_dict(self) -> dict:
         return {
             "code": self.code, "name": self.name, "industry": self.industry,
             "buy_date": self.buy_date, "buy_price": self.buy_price,
             "shares": self.shares, "target_price": self.target_price,
             "stop_loss": self.stop_loss, "cost_total": self.cost_total,
+            "current_price": self.current_price,
             "sell_date": self.sell_date, "sell_price": self.sell_price,
             "proceeds": self.proceeds, "status": self.status,
-            "realized_pnl": round(self.realized_pnl, 2),
+            # Bug4修复：持仓中显示浮动盈亏，已平仓显示实现盈亏
+            "pnl": round(self.floating_pnl if self.proceeds is None else self.realized_pnl, 2),
+            "pnl_type": "浮动" if self.proceeds is None else "实现",
         }
 
 
@@ -264,6 +274,10 @@ class BBBIGSimulator:
 
         # 大盘风险 → 总仓位上限
         self._risk_to_position = {"低": 0.80, "中": 0.60, "高": 0.30}
+
+        # Bug2修复：止损冷静期记录 code -> 止损日期
+        self._stop_loss_dates: dict[str, str] = {}
+        self.COOLDOWN_DAYS = 10  # 止损后N个交易日内不再买入同一只
 
     # -------- 净值计算 --------
 
@@ -369,6 +383,11 @@ class BBBIGSimulator:
             del self.positions[code]
             exited.append(code)
 
+            # Bug2修复：记录止损冷静期
+            if pos.status == "止损卖出":
+                self._stop_loss_dates[code] = date_str
+                logger.info(f"  [{date_str}] {code} 进入止损冷静期（{self.COOLDOWN_DAYS}个交易日）")
+
         return exited
 
     # -------- 买入逻辑 --------
@@ -384,6 +403,16 @@ class BBBIGSimulator:
         name = rec.get("name", code)
         if code in self.positions:
             return False  # 已持有
+
+        # Bug2修复：检查止损冷静期
+        if code in self._stop_loss_dates:
+            sl_date = self._stop_loss_dates[code]
+            # 获取止损日之后的交易日数
+            all_dates_after = _get_trade_dates_from_db(sl_date, buy_date)
+            days_since = len(all_dates_after) - 1  # 不含止损日本身
+            if days_since < self.COOLDOWN_DAYS:
+                logger.info(f"  [{buy_date}] {code} {name} 止损冷静期中（已{days_since}天，需{self.COOLDOWN_DAYS}天），跳过")
+                return False
 
         buy_low, buy_high = _parse_buy_range(rec.get("suggested_buy_range", ""))
         if buy_low <= 0 or buy_high <= 0:
@@ -534,12 +563,14 @@ class BBBIGSimulator:
             sel_dt = datetime.strptime(selection_date, "%Y%m%d")
             week_end_dt = sel_dt + timedelta(days=7)
             week_end = week_end_dt.strftime("%Y%m%d")
-            week_dates = [d for d in all_trade_dates[i:]
-                          if d < week_end or d == all_trade_dates[-1]]
-            # 防止空周
+
+            # Bug1修复：正确分组，移除错误的 or d == all_trade_dates[-1]
+            week_dates = [d for d in all_trade_dates[i:] if d < week_end]
             if not week_dates:
-                i += 1
-                continue
+                # 最后一周不足7天，取剩余全部日期
+                week_dates = all_trade_dates[i:]
+            if not week_dates:
+                break
 
             week_idx += 1
             logger.info(f"\n{'='*60}")
@@ -710,10 +741,12 @@ class BBBIGSimulator:
             lines.append("  📦 剩余持仓（按最新价）")
             lines.append("─" * 70)
             for p in open_pos:
+                pnl = p.get("pnl", 0)
+                pnl_type = p.get("pnl_type", "浮动")
                 lines.append(f"  {p['code']} {p['name']:<8} 买入{p['buy_price']:.2f} "
                              f"× {p['shares']}股  目标{p['target_price']:.2f} "
                              f"止损{p['stop_loss']:.2f}  "
-                             f"盈亏 {p['realized_pnl']:+.0f}元")
+                             f"{pnl_type}盈亏 {pnl:+.0f}元")
 
         lines.append("")
         lines.append("  ⚠ 免责声明：回测结果仅供参考，历史表现不代表未来收益。投资有风险，入市需谨慎。")
