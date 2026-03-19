@@ -422,7 +422,9 @@ class StockDataFetcher:
 
     def fetch_hot_sectors(self) -> pd.DataFrame:
         """
-        获取行业板块资金流向（缓存优先）
+        获取行业板块资金流向
+        优先使用 moneyflow_ind_ths（同花顺行业资金流），每日只调用一次后缓存到内存，
+        降级为按行业分组统计
         返回列: 板块名称, 涨跌幅, 主力净流入, 主力净流入占比
         """
         try:
@@ -430,42 +432,34 @@ class StockDataFetcher:
             if not trade_date:
                 return pd.DataFrame()
 
-            # 尝试获取行业资金流向
+            # 检查内存缓存（同一天内不重复调用API）
+            cache_key = f"_moneyflow_ind_ths_{trade_date}"
+            if hasattr(self, cache_key):
+                return getattr(self, cache_key)
+
+            # 方案1：同花顺行业资金流向接口（moneyflow_ind_ths）
             try:
-                df = self.pro.moneyflow_ind(trade_date=trade_date)
+                df = self.pro.moneyflow_ind_ths(trade_date=trade_date)
                 self._api_sleep()
-
                 if df is not None and not df.empty:
-                    df['主力净流入'] = (df['super_net_inflow'] + df['big_net_inflow']) * 10000
-                    total_flow = df['buy_elg_amount'] + df['buy_lg_amount'] + df['sell_elg_amount'] + df['sell_lg_amount']
-                    df['主力净流入占比'] = (df['主力净流入'] / (total_flow * 10000).replace(0, float('nan')) * 100).round(2)
-
-                    industry_map = self._get_industry_name_map()
-                    df['板块名称'] = df['industry'].map(industry_map).fillna(df['industry'])
-
-                    # 行业涨跌幅
-                    df['涨跌幅'] = 0.0
-                    try:
-                        self._ensure_daily(trade_date)
-                        daily_df = db_cache.get_daily_by_date(trade_date)
-                        stock_basic = self._get_stock_basic()
-                        if not daily_df.empty and not stock_basic.empty:
-                            merged = daily_df.merge(stock_basic[['ts_code', 'industry']], on='ts_code', how='left')
-                            industry_chg = merged.groupby('industry')['pct_chg'].mean().reset_index()
-                            industry_chg.columns = ['industry', '涨跌幅']
-                            df = df.merge(industry_chg, on='industry', how='left', suffixes=('_old', ''))
-                            if '涨跌幅_old' in df.columns:
-                                df.drop(columns=['涨跌幅_old'], inplace=True)
-                    except Exception:
-                        pass
-
+                    # net_amount 单位: 亿元; 转为与其他模块一致的"元"
+                    df['主力净流入'] = pd.to_numeric(df['net_amount'], errors='coerce').fillna(0) * 1e8
+                    df['涨跌幅'] = pd.to_numeric(df['pct_change'], errors='coerce').fillna(0)
+                    df['板块名称'] = df['industry'].fillna(df['ts_code'])
+                    total_abs = df['主力净流入'].abs().sum()
+                    df['主力净流入占比'] = (df['主力净流入'] / total_abs * 100).round(2) if total_abs > 0 else 0.0
                     df = df.sort_values('主力净流入', ascending=False).head(20)
-                    return df[['板块名称', '涨跌幅', '主力净流入', '主力净流入占比']].reset_index(drop=True)
+                    result = df[['板块名称', '涨跌幅', '主力净流入', '主力净流入占比']].reset_index(drop=True)
+                    setattr(self, cache_key, result)  # 缓存到内存
+                    return result
             except Exception as e:
-                logger.warning(f"moneyflow_ind 接口异常: {e}")
+                logger.warning(f"moneyflow_ind_ths 接口异常: {e}")
 
-            # 降级方案：通过缓存的日行情 + 基础信息按行业分组
-            return self._calc_sector_stats_by_industry(trade_date)
+            # 降级方案：通过缓存的日行情 + 基础信息按行业分组（无主力净流入数据）
+            logger.info("行业资金流接口不可用，降级为按行业分组统计涨跌幅")
+            result = self._calc_sector_stats_by_industry(trade_date)
+            setattr(self, cache_key, result)
+            return result
 
         except Exception as e:
             logger.error(f"获取行业板块资金流异常: {e}")

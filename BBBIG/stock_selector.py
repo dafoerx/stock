@@ -465,22 +465,26 @@ def _prefilter_candidates(all_stocks: pd.DataFrame, kline_map: dict,
 
 
 def _fetch_kline_batch(codes: list, days: int = KLINE_DAYS) -> dict:
-    """批量获取K线数据"""
+    """批量获取K线数据，限速防止 Tushare IP超限，单线程串行+重试"""
     kline_map = {}
-
-    def _fetch_one(code):
-        time.sleep(random.uniform(0.05, 0.3))
-        return code, fetcher.fetch_stock_kline(code, days=days)
-
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(_fetch_one, code): code for code in codes}
-        for future in as_completed(futures):
+    total = len(codes)
+    for i, code in enumerate(codes, 1):
+        for attempt in range(3):  # 最多重试3次
             try:
-                code, kline = future.result()
+                time.sleep(random.uniform(0.15, 0.4))
+                kline = fetcher.fetch_stock_kline(code, days=days)
                 if not kline.empty:
                     kline_map[code] = kline
+                break  # 成功则跳出重试
             except Exception as e:
-                logger.warning(f"获取K线异常: {e}")
+                if attempt < 2:
+                    wait = 1.5 * (attempt + 1)
+                    logger.debug(f"K线获取失败({code})，{wait:.1f}s后重试: {e}")
+                    time.sleep(wait)
+                else:
+                    logger.warning(f"K线获取失败({code})，已跳过: {e}")
+        if i % 50 == 0:
+            logger.info(f"  K线获取进度: {i}/{total}，已获取 {len(kline_map)} 只")
     return kline_map
 
 
@@ -559,16 +563,21 @@ def run_stock_selection() -> dict:
     # Step 4: 先获取活跃股K线，再进行多因子预筛选
     logger.info("[4/6] 获取候选股K线 + 多因子预筛选...")
 
-    # 先粗筛出200只活跃股获取K线
+    # 粗筛：基础面过滤
     rough_df = all_stocks.copy()
     rough_df = rough_df[rough_df["总市值"] >= MIN_MARKET_CAP]
     rough_df = rough_df[rough_df["成交额"] >= MIN_VOLUME]
     rough_df = rough_df[(rough_df["市盈率动"] > 0) & (rough_df["市盈率动"] < 200)]
     rough_df = rough_df[rough_df["市净率"] > 0]
 
-    # 按成交额排序取前200
-    rough_df = rough_df.sort_values("成交额", ascending=False).head(200)
+    # 问题1修复：70%成交额排名靠前 + 30%随机抽样，避免永远只看大市值活跃股
+    top_140 = rough_df.sort_values("成交额", ascending=False).head(140)
+    remaining = rough_df[~rough_df["代码"].isin(top_140["代码"])]
+    random_60 = remaining.sample(n=min(60, len(remaining)), random_state=None) if len(remaining) > 0 else pd.DataFrame()
+    rough_df = pd.concat([top_140, random_60], ignore_index=True)
+    rough_df = rough_df.drop_duplicates(subset=["代码"]).head(200)
     rough_codes = rough_df["代码"].tolist()
+    logger.info(f"  粗筛: 成交额TOP140 + 随机{len(random_60)}只 = {len(rough_codes)}只候选")
 
     kline_map = _fetch_kline_batch(rough_codes, days=KLINE_DAYS)
     logger.info(f"  成功获取 {len(kline_map)} 只股票K线")
@@ -605,7 +614,7 @@ def run_stock_selection() -> dict:
     elif market_risk["risk_level"] == "中":
         risk_note = f"\n⚠ 当前市场风险中等（大盘近5日涨跌{market_risk['index_chg_5d']:+.1f}%），请适当控制仓位。"
 
-    # 构造候选股数据摘要（含技术指标）
+    # 构造候选股数据摘要（含技术指标 + 多因子评分明细）
     stock_summaries = []
     for _, row in candidates.head(50).iterrows():
         code = row["代码"]
@@ -614,29 +623,52 @@ def run_stock_selection() -> dict:
         if not ind and not kline.empty:
             ind = calc_technical_indicators(kline)
         kline_text = _format_kline_summary_enhanced(kline, ind)
+
+        # 问题3修复：将多因子各维度得分展开，让AI有据可依
+        factor_score = row.get('factor_score', 0)
+        # 重新计算各子项得分，供AI参考
+        trend_s = 0
+        if ind.get('ma_bull'): trend_s += 10
+        elif ind.get('ma_bear'): trend_s -= 5
+        if ind.get('macd_signal') in ('金叉', '多头'): trend_s += 5
+        vol_s = 0
+        vt = ind.get('vol_trend', 1.0)
+        if 1.2 <= vt <= 2.5: vol_s = 8
+        elif vt > 2.5: vol_s = 1
+        elif vt < 1.0: vol_s = -2
+        else: vol_s = 3
+        if ind.get('vol_price_corr', 0) > 0.3: vol_s += 3
+        hot_s = 8 if row.get('所处行业', '') in hot_industries else 0
+
         stock_summaries.append(
             f"【{code} {row['名称']}】 行业:{row['所处行业']} "
             f"最新价:{row['最新价']:.2f} 涨跌幅:{row['涨跌幅']:.2f}% "
             f"成交额:{row['成交额']/1e8:.2f}亿 换手率:{row['换手率']:.2f}% "
             f"市盈率:{row['市盈率动']:.1f} 市净率:{row['市净率']:.2f} "
-            f"总市值:{row['总市值']/1e8:.0f}亿 量比:{row['量比']:.2f} "
-            f"多因子评分:{row.get('factor_score', 0):.1f}\n"
+            f"总市值:{row['总市值']/1e8:.0f}亿 量比:{row['量比']:.2f}\n"
+            f"  [量化预评分] 总分:{factor_score:.1f} "
+            f"(趋势子项:{trend_s} 量能子项:{vol_s} 板块热度子项:{hot_s} "
+            f"近5日涨幅:{ind.get('chg_5d',0):.1f}% 距20日高点:{ind.get('dist_high_20d',0):.1f}%)\n"
             f"  K线及技术指标:\n  {kline_text}"
         )
 
     system_prompt = """你是一位资深的A股量化分析师和投资顾问。请基于提供的市场数据进行专业分析。
 
+候选股票已经过量化多因子预评分（综合了趋势、量能、动量、估值、板块热度、追高惩罚8个维度），
+请在你的评分中**重点参考"量化预评分"字段**，并结合你对K线形态和市场背景的理解进行最终裁决。
+量化预评分高的股票不一定都要选，但如果你给某只量化预评分低的股票高分，请在理由中说明原因。
+
 你必须严格按照以下评分框架对每只候选股票进行打分（满分100分）：
 
 ## 评分维度（共5项，每项20分）：
 
-### 1. 趋势评分（20分）
+### 1. 趋势评分（20分）[参考量化预评分中的趋势子项]
 - 均线多头排列（MA5>MA10>MA20）: +15分
 - MACD金叉或多头: +5分
 - 均线空头排列: -10分
 - MACD死叉: -5分
 
-### 2. 量能评分（20分）
+### 2. 量能评分（20分）[参考量化预评分中的量能子项]
 - 近3日温和放量（1.2~2.5倍）且量价正相关: +15分
 - 极端放量（>3倍）: +5分（可能冲顶）
 - 缩量: +8分（如在上涨趋势中可能是洗盘）
@@ -654,15 +686,16 @@ def run_stock_selection() -> dict:
 - 布林带下轨附近（<0.3）: +8分
 - RSI > 75 或 KDJ超买: -10分
 
-### 5. 板块热度评分（20分）
+### 5. 板块热度评分（20分）[参考量化预评分中的板块热度子项和行业资金流数据]
 - 所属行业为当日主力净流入TOP5: +15分
-- 所属概念板块为当日热点: +10分
+- 所属行业主力净流入为正: +10分
 - 所属行业主力净流出: -5分
 
 ## 输出要求：
 - 选出总评分最高的股票
 - 同一行业最多选3只
 - 必须给出每只股票的总评分和各维度得分
+- 量化预评分低但你认为值得入选的，在reason中说明理由
 - 高风险市场环境下优先选择低波动、高分红防御标的"""
 
     user_prompt = f"""请分析以下A股市场数据，从候选股票中选出最值得投资的前{effective_top_n}支股票。
