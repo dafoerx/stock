@@ -404,7 +404,6 @@ class StockDataFetcher:
                     # index_daily 没有 pre_close，补充计算
                     df['pre_close'] = df['close'].shift(1)
                     db_cache.save_index_daily(df)
-                    self._api_sleep()
                 else:
                     df = df.sort_values('trade_date').reset_index(drop=True)
                     # 补充 pre_close

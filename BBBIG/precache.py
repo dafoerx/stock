@@ -337,7 +337,7 @@ def main():
     parser.add_argument('--days',    type=int, default=30,  help='全市场行情缓存天数（默认30）')
     parser.add_argument('--kline',   type=int, default=60,  help='个股K线天数（默认60，回测建议120）')
     parser.add_argument('--topn',    type=int, default=100, help='活跃股数量（默认100）')
-    parser.add_argument('--workers', type=int, default=3,   help='个股K线并发线程数（默认3，最多5）')
+    parser.add_argument('--workers', type=int, default=3,   help='个股K线并发线程数（默认3，最多4）')
     parser.add_argument('--full',    action='store_true',   help='完整模式：90天行情+120天个股K线+200只股')
     parser.add_argument('--stats',   action='store_true',   help='仅打印当前缓存统计')
     args = parser.parse_args()
