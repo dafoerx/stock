@@ -16,8 +16,8 @@ from BBBIG.db_cache import db_cache
 
 logger = logging.getLogger("BBBIG")
 
-# 全局 Tushare API 并发信号量：任何时刻最多 4 个线程同时调用 Tushare
-_tushare_semaphore = threading.Semaphore(4)
+# 全局 Tushare API 并发信号量：串行化所有 Tushare 调用（快速请求会触发"IP超限"限流）
+_tushare_semaphore = threading.Semaphore(1)
 
 
 class StockDataFetcher:
@@ -26,14 +26,39 @@ class StockDataFetcher:
     def __init__(self):
         ts.set_token(TUSHARE_TOKEN)
         self.pro = ts.pro_api()
-        self._api_interval = 0.5  # API 调用间隔（秒）
+        self._api_interval = 2.0  # API 调用间隔（秒），低于2s会触发Tushare "IP超限"限流
 
     def _api_sleep(self):
         """API 调用间隔，避免限流"""
         time.sleep(self._api_interval)
 
-    def _call_api(self, fn, *args, **kwargs):
-        """带并发控制的 Tushare API 调用（全局最多 4 并发）"""
+    def _call_api(self, fn, *args, max_retries=3, **kwargs):
+        """带并发控制的 Tushare API 调用（串行 + 限流自动退避重试）
+
+        限流机制（实测）：Tushare 用滑动窗口限流，连续快速请求 ~5 次后触发
+        "IP数量超限"惩罚，惩罚期约 60s。因此：
+          - 正常调用间隔 2s（_api_interval）
+          - 触发限流后等 60s 再重试
+        """
+        for attempt in range(max_retries):
+            with _tushare_semaphore:
+                try:
+                    result = fn(*args, **kwargs)
+                    self._api_sleep()
+                    return result
+                except Exception as e:
+                    err = str(e)
+                    if "IP数量超限" in err or ("IP" in err and "超限" in err):
+                        wait = 60  # 实测惩罚期 ~60s
+                        logger.warning(f"Tushare 限流（IP超限），等待 {wait}s 冷却后重试（{attempt+1}/{max_retries}）...")
+                        time.sleep(wait)
+                    elif "每分钟" in err or "频次" in err:
+                        wait = 30
+                        logger.warning(f"Tushare 频率限制，等待 {wait}s 后重试（{attempt+1}/{max_retries}）...")
+                        time.sleep(wait)
+                    else:
+                        raise
+        # 最后一次不捕获异常，让调用者处理
         with _tushare_semaphore:
             result = fn(*args, **kwargs)
             self._api_sleep()
@@ -368,7 +393,8 @@ class StockDataFetcher:
                 df = db_cache.get_index_daily(ts_code, start_date, end_date)
                 if df.empty:
                     logger.info(f"从 Tushare 获取指数 {ts_code} [{start_date}~{end_date}] K线...")
-                    df = self.pro.index_daily(
+                    df = self._call_api(
+                        self.pro.index_daily,
                         ts_code=ts_code, start_date=start_date, end_date=end_date
                     )
                     if df is None or df.empty:
@@ -470,8 +496,7 @@ class StockDataFetcher:
 
             # 方案1：同花顺行业资金流向接口（moneyflow_ind_ths）
             try:
-                df = self.pro.moneyflow_ind_ths(trade_date=trade_date)
-                self._api_sleep()
+                df = self._call_api(self.pro.moneyflow_ind_ths, trade_date=trade_date)
                 if df is not None and not df.empty:
                     # 写入 SQLite 缓存
                     db_cache.save_moneyflow_ind(df, trade_date)
@@ -538,8 +563,7 @@ class StockDataFetcher:
                 moneyflow_df = db_cache.get_moneyflow(trade_date)
             else:
                 try:
-                    moneyflow_df = self.pro.moneyflow(trade_date=trade_date)
-                    self._api_sleep()
+                    moneyflow_df = self._call_api(self.pro.moneyflow, trade_date=trade_date)
                     if moneyflow_df is not None and not moneyflow_df.empty:
                         db_cache.save_moneyflow(moneyflow_df, trade_date)
                 except Exception:
