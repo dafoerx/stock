@@ -104,6 +104,45 @@ class StockDBCache:
                     synced_at TEXT,
                     PRIMARY KEY (data_type, trade_date)
                 );
+
+                -- 指数日行情
+                CREATE TABLE IF NOT EXISTS index_daily (
+                    ts_code TEXT,
+                    trade_date TEXT,
+                    open REAL,
+                    high REAL,
+                    low REAL,
+                    close REAL,
+                    pre_close REAL,
+                    change REAL,
+                    pct_chg REAL,
+                    vol REAL,
+                    amount REAL,
+                    PRIMARY KEY (ts_code, trade_date)
+                );
+                CREATE INDEX IF NOT EXISTS idx_index_daily_date ON index_daily(trade_date);
+
+                -- 行业资金流向（同花顺）
+                CREATE TABLE IF NOT EXISTS moneyflow_ind (
+                    trade_date TEXT,
+                    ts_code TEXT,
+                    industry TEXT,
+                    pct_change REAL,
+                    net_amount REAL,
+                    PRIMARY KEY (trade_date, ts_code)
+                );
+
+                -- 个股资金流向
+                CREATE TABLE IF NOT EXISTS moneyflow (
+                    trade_date TEXT,
+                    ts_code TEXT,
+                    net_mf_amount REAL,
+                    buy_elg_amount REAL,
+                    buy_lg_amount REAL,
+                    sell_elg_amount REAL,
+                    sell_lg_amount REAL,
+                    PRIMARY KEY (trade_date, ts_code)
+                );
             """)
             conn.commit()
         finally:
@@ -376,6 +415,146 @@ class StockDBCache:
         finally:
             conn.close()
 
+    # ========== 指数日行情 ==========
+
+    def get_index_daily(self, ts_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+        """获取指数日行情"""
+        conn = self._get_conn()
+        try:
+            df = pd.read_sql(
+                "SELECT * FROM index_daily WHERE ts_code=? AND trade_date BETWEEN ? AND ? ORDER BY trade_date",
+                conn, params=(ts_code, start_date, end_date)
+            )
+            return df
+        finally:
+            conn.close()
+
+    def save_index_daily(self, df: pd.DataFrame):
+        """保存指数日行情"""
+        if df is None or df.empty:
+            return
+        conn = self._get_conn()
+        try:
+            cols = ['ts_code', 'trade_date', 'open', 'high', 'low', 'close',
+                    'pre_close', 'change', 'pct_chg', 'vol', 'amount']
+            for _, row in df.iterrows():
+                values = tuple(row.get(c, None) for c in cols)
+                conn.execute(
+                    f"INSERT OR REPLACE INTO index_daily ({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})",
+                    values
+                )
+            conn.commit()
+            logger.info(f"缓存指数行情 {len(df)} 条")
+        finally:
+            conn.close()
+
+    def has_index_daily(self, ts_code: str, start_date: str, end_date: str) -> bool:
+        """检查指数某段日期是否有足够缓存数据"""
+        conn = self._get_conn()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM index_daily WHERE ts_code=? AND trade_date BETWEEN ? AND ?",
+                (ts_code, start_date, end_date)
+            ).fetchone()
+            return row[0] > 0
+        finally:
+            conn.close()
+
+    # ========== 行业资金流向 ==========
+
+    def get_moneyflow_ind(self, trade_date: str) -> pd.DataFrame:
+        """获取某日行业资金流向"""
+        conn = self._get_conn()
+        try:
+            df = pd.read_sql(
+                "SELECT * FROM moneyflow_ind WHERE trade_date=?",
+                conn, params=(trade_date,)
+            )
+            return df
+        finally:
+            conn.close()
+
+    def save_moneyflow_ind(self, df: pd.DataFrame, trade_date: str):
+        """保存行业资金流向"""
+        if df is None or df.empty:
+            return
+        conn = self._get_conn()
+        try:
+            for _, row in df.iterrows():
+                conn.execute(
+                    "INSERT OR REPLACE INTO moneyflow_ind (trade_date, ts_code, industry, pct_change, net_amount) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (trade_date,
+                     row.get('ts_code', ''),
+                     row.get('industry', ''),
+                     row.get('pct_change', None),
+                     row.get('net_amount', None))
+                )
+            conn.commit()
+            logger.info(f"缓存 {trade_date} 行业资金流向 {len(df)} 条")
+        finally:
+            conn.close()
+
+    def has_moneyflow_ind(self, trade_date: str) -> bool:
+        """检查某日行业资金流向是否已缓存"""
+        conn = self._get_conn()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM moneyflow_ind WHERE trade_date=?", (trade_date,)
+            ).fetchone()
+            return row[0] > 0
+        finally:
+            conn.close()
+
+    # ========== 个股资金流向 ==========
+
+    def get_moneyflow(self, trade_date: str) -> pd.DataFrame:
+        """获取某日个股资金流向"""
+        conn = self._get_conn()
+        try:
+            df = pd.read_sql(
+                "SELECT * FROM moneyflow WHERE trade_date=?",
+                conn, params=(trade_date,)
+            )
+            return df
+        finally:
+            conn.close()
+
+    def save_moneyflow(self, df: pd.DataFrame, trade_date: str):
+        """保存个股资金流向"""
+        if df is None or df.empty:
+            return
+        conn = self._get_conn()
+        try:
+            for _, row in df.iterrows():
+                conn.execute(
+                    "INSERT OR REPLACE INTO moneyflow "
+                    "(trade_date, ts_code, net_mf_amount, buy_elg_amount, buy_lg_amount, "
+                    "sell_elg_amount, sell_lg_amount) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (trade_date,
+                     row.get('ts_code', ''),
+                     row.get('net_mf_amount', None),
+                     row.get('buy_elg_amount', None),
+                     row.get('buy_lg_amount', None),
+                     row.get('sell_elg_amount', None),
+                     row.get('sell_lg_amount', None))
+                )
+            conn.commit()
+            logger.info(f"缓存 {trade_date} 个股资金流向 {len(df)} 条")
+        finally:
+            conn.close()
+
+    def has_moneyflow(self, trade_date: str) -> bool:
+        """检查某日个股资金流向是否已缓存"""
+        conn = self._get_conn()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM moneyflow WHERE trade_date=?", (trade_date,)
+            ).fetchone()
+            return row[0] > 0
+        finally:
+            conn.close()
+
     # ========== 同步记录 ==========
 
     def mark_synced(self, data_type: str, trade_date: str):
@@ -426,7 +605,9 @@ class StockDBCache:
         conn = self._get_conn()
         try:
             stats = {}
-            for table in ['trade_cal', 'stock_basic', 'daily', 'daily_basic', 'concept', 'concept_detail', 'sync_log']:
+            for table in ['trade_cal', 'stock_basic', 'daily', 'daily_basic',
+                         'index_daily', 'moneyflow_ind', 'moneyflow',
+                         'concept', 'concept_detail', 'sync_log']:
                 row = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
                 stats[table] = row[0]
             return stats
