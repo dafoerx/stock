@@ -1,6 +1,6 @@
 """
 策略1：双均线金叉死叉
-fast 均线上穿 slow 均线买入，下穿卖出
+fast 均线上穿 slow 均线买入，下穿平仓
 """
 from backtesting import Strategy
 from backtesting.lib import crossover
@@ -27,7 +27,7 @@ class SmaCross(Strategy):
         self.sma_slow = self.I(SMA, close, self.slow)
 
     def next(self):
-        if crossover(self.sma_fast, self.sma_slow):
+        if crossover(self.sma_fast, self.sma_slow) and not self.position:
             self.buy()
-        elif crossover(self.sma_slow, self.sma_fast):
-            self.sell()
+        elif crossover(self.sma_slow, self.sma_fast) and self.position:
+            self.position.close()

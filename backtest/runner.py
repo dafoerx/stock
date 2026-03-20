@@ -3,17 +3,42 @@ backtest/runner.py — 回测执行器
 统一封装 backtesting.py 的 Backtest 调用，支持单股/批量/参数优化
 """
 
-import json
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 from backtesting import Backtest
 
-from .loader import load_stock, load_stocks
+from .loader import load_stock
 
 RESULTS_DIR = Path(__file__).parent / "results"
 RESULTS_DIR.mkdir(exist_ok=True)
+RESULT_COLUMNS = [
+    "ts_code",
+    "strategy",
+    "start_date",
+    "end_date",
+    "data_rows",
+    "return_pct",
+    "buy_hold_pct",
+    "sharpe",
+    "max_drawdown_pct",
+    "win_rate_pct",
+    "num_trades",
+    "profit_factor",
+]
+
+
+def _round_stat(value, digits: int, default: float = 0.0) -> float:
+    if value is None or pd.isna(value):
+        value = default
+    return round(float(value), digits)
+
+
+def _int_stat(value, default: int = 0) -> int:
+    if value is None or pd.isna(value):
+        return default
+    return int(value)
 
 
 def run_single(
@@ -54,13 +79,13 @@ def run_single(
         "start_date": start_date,
         "end_date": end_date,
         "data_rows": len(df),
-        "return_pct": round(float(stats["Return [%]"]), 2),
-        "buy_hold_pct": round(float(stats["Buy & Hold Return [%]"]), 2),
-        "sharpe": round(float(stats["Sharpe Ratio"]), 3),
-        "max_drawdown_pct": round(float(stats["Max. Drawdown [%]"]), 2),
-        "win_rate_pct": round(float(stats["Win Rate [%]"]), 1),
-        "num_trades": int(stats["# Trades"]),
-        "profit_factor": round(float(stats.get("Profit Factor", 0) or 0), 2),
+        "return_pct": _round_stat(stats.get("Return [%]"), 2),
+        "buy_hold_pct": _round_stat(stats.get("Buy & Hold Return [%]"), 2),
+        "sharpe": _round_stat(stats.get("Sharpe Ratio"), 3),
+        "max_drawdown_pct": _round_stat(stats.get("Max. Drawdown [%]"), 2),
+        "win_rate_pct": _round_stat(stats.get("Win Rate [%]"), 1),
+        "num_trades": _int_stat(stats.get("# Trades")),
+        "profit_factor": _round_stat(stats.get("Profit Factor"), 2),
     }
 
     if verbose:
@@ -105,9 +130,13 @@ def run_batch(
         except Exception as e:
             print(f"  ✗ {code}  跳过: {e}")
 
-    df = pd.DataFrame(results).sort_values("return_pct", ascending=False).reset_index(drop=True)
+    if not results:
+        print("\n没有可用的回测结果")
+        return pd.DataFrame(columns=RESULT_COLUMNS)
 
-    if save and not df.empty:
+    df = pd.DataFrame(results, columns=RESULT_COLUMNS).sort_values("return_pct", ascending=False).reset_index(drop=True)
+
+    if save:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_path = RESULTS_DIR / f"batch_{strategy_cls.__name__}_{ts}.json"
         df.to_json(out_path, orient="records", force_ascii=False, indent=2)
@@ -142,7 +171,7 @@ def optimize(
     df = load_stock(ts_code, start_date, end_date, db_path)
     bt = Backtest(df, strategy_cls, cash=cash, commission=commission,
                   exclusive_orders=True, finalize_trades=True)
-    stats, heatmap = bt.optimize(
+    stats, _ = bt.optimize(
         **param_grid,
         maximize=maximize,
         return_heatmap=True,
