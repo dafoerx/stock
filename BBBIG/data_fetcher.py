@@ -6,6 +6,7 @@
 """
 import time
 import logging
+import threading
 import tushare as ts
 import pandas as pd
 from datetime import datetime, timedelta
@@ -14,6 +15,9 @@ from BBBIG.config import TUSHARE_TOKEN
 from BBBIG.db_cache import db_cache
 
 logger = logging.getLogger("BBBIG")
+
+# 全局 Tushare API 并发信号量：任何时刻最多 4 个线程同时调用 Tushare
+_tushare_semaphore = threading.Semaphore(4)
 
 
 class StockDataFetcher:
@@ -27,6 +31,13 @@ class StockDataFetcher:
     def _api_sleep(self):
         """API 调用间隔，避免限流"""
         time.sleep(self._api_interval)
+
+    def _call_api(self, fn, *args, **kwargs):
+        """带并发控制的 Tushare API 调用（全局最多 4 并发）"""
+        with _tushare_semaphore:
+            result = fn(*args, **kwargs)
+            self._api_sleep()
+            return result
 
     # ========== 交易日历（缓存优先） ==========
 
@@ -43,14 +54,14 @@ class StockDataFetcher:
         # 获取整年交易日历
         logger.info("从 Tushare 获取交易日历...")
         try:
-            cal = self.pro.trade_cal(
+            cal = self._call_api(
+                self.pro.trade_cal,
                 exchange='SSE',
                 start_date=(datetime.now() - timedelta(days=365)).strftime('%Y%m%d'),
                 end_date=today
             )
             if cal is not None and not cal.empty:
                 db_cache.save_trade_cal(cal)
-            self._api_sleep()
         except Exception as e:
             logger.warning(f"获取交易日历异常: {e}")
 
@@ -92,13 +103,13 @@ class StockDataFetcher:
 
         logger.info("从 Tushare 获取股票基础信息...")
         try:
-            df = self.pro.stock_basic(
+            df = self._call_api(
+                self.pro.stock_basic,
                 exchange='', list_status='L',
                 fields='ts_code,symbol,name,area,industry,market,list_date'
             )
             if df is not None and not df.empty:
                 db_cache.save_stock_basic(df)
-            self._api_sleep()
         except Exception as e:
             logger.warning(f"获取股票基础信息异常: {e}")
 
@@ -116,12 +127,11 @@ class StockDataFetcher:
 
         logger.info(f"从 Tushare 获取 {trade_date} 日行情...")
         try:
-            df = self.pro.daily(trade_date=trade_date)
+            df = self._call_api(self.pro.daily, trade_date=trade_date)
             if df is not None and not df.empty:
                 db_cache.save_daily(df)
                 db_cache.mark_synced('daily', trade_date)
                 logger.info(f"缓存 {trade_date} 日行情 {len(df)} 条")
-            self._api_sleep()
         except Exception as e:
             logger.error(f"获取 {trade_date} 日行情异常: {e}")
 
@@ -151,11 +161,10 @@ class StockDataFetcher:
             # 按股票代码获取区间数据
             logger.info(f"从 Tushare 获取 {ts_code} [{start_date}~{end_date}] K线...")
             try:
-                df = self.pro.daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
+                df = self._call_api(self.pro.daily, ts_code=ts_code, start_date=start_date, end_date=end_date)
                 if df is not None and not df.empty:
                     db_cache.save_daily(df)
                     logger.info(f"缓存 {ts_code} 日行情 {len(df)} 条")
-                self._api_sleep()
             except Exception as e:
                 logger.error(f"获取 {ts_code} 日行情异常: {e}")
 
@@ -166,7 +175,8 @@ class StockDataFetcher:
 
         logger.info(f"从 Tushare 获取 {trade_date} 每日指标...")
         try:
-            df = self.pro.daily_basic(
+            df = self._call_api(
+                self.pro.daily_basic,
                 trade_date=trade_date,
                 fields='ts_code,turnover_rate,pe_ttm,pb,ps_ttm,total_mv,circ_mv,volume_ratio'
             )
@@ -174,7 +184,6 @@ class StockDataFetcher:
                 db_cache.save_daily_basic(df)
                 db_cache.mark_synced('daily_basic', trade_date)
                 logger.info(f"缓存 {trade_date} 每日指标 {len(df)} 条")
-            self._api_sleep()
         except Exception as e:
             logger.error(f"获取 {trade_date} 每日指标异常: {e}")
 
@@ -355,18 +364,26 @@ class StockDataFetcher:
             start_date = (datetime.strptime(end_date, '%Y%m%d') - timedelta(days=int(days * 1.8) + 30)).strftime('%Y%m%d')
 
             if is_index:
-                # 指数直接从 API 获取，不走股票缓存
-                logger.info(f"从 Tushare 获取指数 {ts_code} [{start_date}~{end_date}] K线...")
-                df = self.pro.index_daily(
-                    ts_code=ts_code, start_date=start_date, end_date=end_date
-                )
-                if df is None or df.empty:
-                    logger.warning(f"未获取到指数 {code} 的K线数据")
-                    return pd.DataFrame()
-                df = df.sort_values('trade_date').reset_index(drop=True)
-                # index_daily 没有 pre_close，补充计算
-                df['pre_close'] = df['close'].shift(1)
-                self._api_sleep()
+                # 指数K线：SQLite 缓存优先
+                df = db_cache.get_index_daily(ts_code, start_date, end_date)
+                if df.empty:
+                    logger.info(f"从 Tushare 获取指数 {ts_code} [{start_date}~{end_date}] K线...")
+                    df = self.pro.index_daily(
+                        ts_code=ts_code, start_date=start_date, end_date=end_date
+                    )
+                    if df is None or df.empty:
+                        logger.warning(f"未获取到指数 {code} 的K线数据")
+                        return pd.DataFrame()
+                    df = df.sort_values('trade_date').reset_index(drop=True)
+                    # index_daily 没有 pre_close，补充计算
+                    df['pre_close'] = df['close'].shift(1)
+                    db_cache.save_index_daily(df)
+                    self._api_sleep()
+                else:
+                    df = df.sort_values('trade_date').reset_index(drop=True)
+                    # 补充 pre_close
+                    if 'pre_close' not in df.columns or df['pre_close'].isna().all():
+                        df['pre_close'] = df['close'].shift(1)
             else:
                 # 增量获取股票数据
                 self._ensure_daily_range(ts_code, start_date, end_date)
@@ -379,7 +396,8 @@ class StockDataFetcher:
                     logger.info(f"缓存无 {code} 数据，从 Tushare 直接获取...")
                     adj_map = {"qfq": "qfq", "hfq": "hfq", "": None}
                     adj = adj_map.get(adjust, "qfq")
-                    df = ts.pro_bar(
+                    df = self._call_api(
+                        ts.pro_bar,
                         ts_code=ts_code, start_date=start_date, end_date=end_date,
                         adj=adj, factors=['tor']
                     )
@@ -389,7 +407,6 @@ class StockDataFetcher:
                     else:
                         logger.warning(f"未获取到 {code} 的K线数据")
                         return pd.DataFrame()
-                    self._api_sleep()
 
             # 计算振幅
             df['振幅'] = 0.0
@@ -437,11 +454,27 @@ class StockDataFetcher:
             if hasattr(self, cache_key):
                 return getattr(self, cache_key)
 
+            # SQLite 缓存优先
+            cached_df = db_cache.get_moneyflow_ind(trade_date)
+            if not cached_df.empty:
+                df = cached_df
+                df['主力净流入'] = pd.to_numeric(df['net_amount'], errors='coerce').fillna(0) * 1e8
+                df['涨跌幅'] = pd.to_numeric(df['pct_change'], errors='coerce').fillna(0)
+                df['板块名称'] = df['industry'].fillna(df['ts_code'])
+                total_abs = df['主力净流入'].abs().sum()
+                df['主力净流入占比'] = (df['主力净流入'] / total_abs * 100).round(2) if total_abs > 0 else 0.0
+                df = df.sort_values('主力净流入', ascending=False).head(20)
+                result = df[['板块名称', '涨跌幅', '主力净流入', '主力净流入占比']].reset_index(drop=True)
+                setattr(self, cache_key, result)
+                return result
+
             # 方案1：同花顺行业资金流向接口（moneyflow_ind_ths）
             try:
                 df = self.pro.moneyflow_ind_ths(trade_date=trade_date)
                 self._api_sleep()
                 if df is not None and not df.empty:
+                    # 写入 SQLite 缓存
+                    db_cache.save_moneyflow_ind(df, trade_date)
                     # net_amount 单位: 亿元; 转为与其他模块一致的"元"
                     df['主力净流入'] = pd.to_numeric(df['net_amount'], errors='coerce').fillna(0) * 1e8
                     df['涨跌幅'] = pd.to_numeric(df['pct_change'], errors='coerce').fillna(0)
@@ -489,10 +522,9 @@ class StockDataFetcher:
             if concepts.empty:
                 logger.info("从 Tushare 获取概念板块列表...")
                 try:
-                    concepts = self.pro.concept()
+                    concepts = self._call_api(self.pro.concept)
                     if concepts is not None and not concepts.empty:
                         db_cache.save_concepts(concepts)
-                    self._api_sleep()
                 except Exception as e:
                     logger.error(f"获取概念列表异常: {e}")
                     return pd.DataFrame()
@@ -500,13 +532,18 @@ class StockDataFetcher:
             if concepts.empty:
                 return pd.DataFrame()
 
-            # 获取资金流向
+            # 个股资金流向（SQLite 缓存优先）
             moneyflow_df = None
-            try:
-                moneyflow_df = self.pro.moneyflow(trade_date=trade_date)
-                self._api_sleep()
-            except Exception:
-                pass
+            if db_cache.has_moneyflow(trade_date):
+                moneyflow_df = db_cache.get_moneyflow(trade_date)
+            else:
+                try:
+                    moneyflow_df = self.pro.moneyflow(trade_date=trade_date)
+                    self._api_sleep()
+                    if moneyflow_df is not None and not moneyflow_df.empty:
+                        db_cache.save_moneyflow(moneyflow_df, trade_date)
+                except Exception:
+                    pass
 
             results = []
             for _, concept in concepts.head(30).iterrows():
@@ -515,8 +552,8 @@ class StockDataFetcher:
                     # 成分股（缓存优先）
                     codes = db_cache.get_concept_detail(concept_code)
                     if not codes:
-                        self._api_sleep()
-                        detail = self.pro.concept_detail(id=concept_code, fields='ts_code')
+                        detail = self._call_api(
+                            self.pro.concept_detail, id=concept_code, fields='ts_code')
                         if detail is not None and not detail.empty:
                             codes = detail['ts_code'].tolist()
                             db_cache.save_concept_detail(concept_code, codes)

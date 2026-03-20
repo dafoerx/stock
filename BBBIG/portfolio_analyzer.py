@@ -161,7 +161,7 @@ def run_portfolio_analysis() -> dict:
         kline = fetcher.fetch_stock_kline(code, days=KLINE_DAYS)
         return code, kline
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {executor.submit(_fetch_one, item): item for item in portfolio}
         for future in as_completed(futures):
             try:

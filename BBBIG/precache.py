@@ -352,8 +352,8 @@ def main():
         args.topn    = 200
         args.workers = 3
 
-    # 限制并发数，避免超限
-    args.workers = min(args.workers, 5)
+    # 限制并发数，Tushare 不超过 4 并发
+    args.workers = min(args.workers, 4)
 
     logger.info("=" * 50)
     logger.info("🚀 BBBIG 数据预缓存开始")

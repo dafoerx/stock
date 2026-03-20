@@ -259,7 +259,7 @@ def _quant_select_at_date(analysis_date: str, top_n: int = TOP_N) -> list:
         time.sleep(random.uniform(0.05, 0.2))
         return code, fetcher.fetch_stock_kline(code, days=KLINE_DAYS, end_date_str=analysis_date)
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {executor.submit(_fetch_one, c): c for c in codes[:100]}  # 限制数量
         for future in as_completed(futures):
             try:
@@ -467,7 +467,7 @@ def _run_selection_at_date(analysis_date: str, candidate_codes: list = None) -> 
         )
         return code, before_df, after_df
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {executor.submit(_fetch_one, c): c for c in candidate_codes}
         for future in as_completed(futures):
             try:
