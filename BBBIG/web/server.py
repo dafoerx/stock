@@ -249,11 +249,16 @@ class HistoryDetailHandler(BaseHandler):
     """获取历史分析结果详情"""
     def get(self):
         filename = self.get_argument("filename", "")
-        if not filename or ".." in filename or "/" in filename:
+        if not filename or ".." in filename or "/" in filename or "\\" in filename:
             self.set_status(400)
             self.write(json.dumps({"error": "无效文件名"}, ensure_ascii=False))
             return
         fpath = os.path.join(RESULT_DIR, filename)
+        # 防止路径穿越
+        if not os.path.realpath(fpath).startswith(os.path.realpath(RESULT_DIR)):
+            self.set_status(403)
+            self.write(json.dumps({"error": "禁止访问"}, ensure_ascii=False))
+            return
         if not os.path.exists(fpath):
             self.set_status(404)
             self.write(json.dumps({"error": "文件不存在"}, ensure_ascii=False))

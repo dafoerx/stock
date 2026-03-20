@@ -32,9 +32,23 @@ def _save_result(result: dict, prefix: str):
 
 
 def _is_trade_day() -> bool:
-    """简单判断今天是否为交易日（周一至周五）"""
+    """判断今天是否为交易日，优先用交易日历（含法定假日），回退到weekday"""
     today = datetime.now()
-    return today.weekday() < 5  # 0=周一, 4=周五
+    today_str = today.strftime("%Y%m%d")
+
+    try:
+        from BBBIG.db_cache import db_cache
+        dates = db_cache.get_trade_dates(today_str, today_str)
+        if dates:
+            return True
+        # 如果交易日历有数据但今天不在其中，说明今天不是交易日
+        if db_cache.has_trade_cal(today.strftime("%Y%m")):
+            return False
+    except Exception:
+        pass
+
+    # 回退: 简单判断周一至周五
+    return today.weekday() < 5
 
 
 def daily_job():

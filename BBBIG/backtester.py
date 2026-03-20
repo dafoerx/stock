@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from BBBIG.data_fetcher import fetcher
 from BBBIG.deepseek_client import deepseek
-from BBBIG.config import TOP_N, KLINE_DAYS, RESULT_DIR, AI_TEMPERATURE
+from BBBIG.config import TOP_N, KLINE_DAYS, RESULT_DIR, AI_TEMPERATURE, AI_MAX_TOKENS, TOTAL_TRADE_COST
 
 import os
 
@@ -26,8 +26,22 @@ logger = logging.getLogger("BBBIG")
 
 
 def _get_trade_date_before(weeks: int) -> str:
-    """获取 N 周前的日期（回退到最近交易日），返回 YYYYMMDD"""
+    """获取 N 周前的最近交易日，优先用交易日历，回退到weekday判断"""
     target = datetime.now() - timedelta(weeks=weeks)
+    target_str = target.strftime("%Y%m%d")
+
+    # 优先使用交易日历
+    try:
+        from BBBIG.db_cache import db_cache
+        # 查找目标日期前后5天范围内的最近交易日
+        start = (target - timedelta(days=10)).strftime("%Y%m%d")
+        dates = db_cache.get_trade_dates(start, target_str)
+        if dates:
+            return dates[-1]  # 取最近的交易日
+    except Exception:
+        pass
+
+    # 回退: 跳过周末
     while target.weekday() >= 5:
         target -= timedelta(days=1)
     return target.strftime("%Y%m%d")
@@ -157,9 +171,11 @@ def _evaluate_recommendation(rec: dict, after_df: pd.DataFrame, before_df: pd.Da
     result["max_price"] = max_price
     result["min_price"] = min_price
     result["end_price"] = end_price
-    result["max_profit_pct"] = round((max_price - buy_price) / buy_price * 100, 2)
-    result["max_loss_pct"] = round((min_price - buy_price) / buy_price * 100, 2)
-    result["final_profit_pct"] = round((end_price - buy_price) / buy_price * 100, 2)
+    # 扣除交易成本（买卖佣金+印花税，约0.16%）
+    cost_pct = TOTAL_TRADE_COST * 100  # 转为百分比
+    result["max_profit_pct"] = round((max_price - buy_price) / buy_price * 100 - cost_pct, 2)
+    result["max_loss_pct"] = round((min_price - buy_price) / buy_price * 100 - cost_pct, 2)
+    result["final_profit_pct"] = round((end_price - buy_price) / buy_price * 100 - cost_pct, 2)
 
     result["hit_target"] = (max_price >= target) if target > 0 else False
     result["hit_stop_loss"] = (min_price <= stop_loss) if stop_loss > 0 else False
@@ -176,19 +192,19 @@ def _evaluate_recommendation(rec: dict, after_df: pd.DataFrame, before_df: pd.Da
         if target_day is not None and stop_day is not None:
             if target_day <= stop_day:
                 result["outcome"] = "盈利（先触达目标价）"
-                result["realized_pct"] = round((target - buy_price) / buy_price * 100, 2)
+                result["realized_pct"] = round((target - buy_price) / buy_price * 100 - cost_pct, 2)
             else:
                 result["outcome"] = "止损（先触达止损价）"
-                result["realized_pct"] = round((stop_loss - buy_price) / buy_price * 100, 2)
+                result["realized_pct"] = round((stop_loss - buy_price) / buy_price * 100 - cost_pct, 2)
         else:
             result["outcome"] = "盈利（触达目标价）"
-            result["realized_pct"] = round((target - buy_price) / buy_price * 100, 2)
+            result["realized_pct"] = round((target - buy_price) / buy_price * 100 - cost_pct, 2)
     elif result["hit_target"]:
         result["outcome"] = "盈利（触达目标价）"
-        result["realized_pct"] = round((target - buy_price) / buy_price * 100, 2)
+        result["realized_pct"] = round((target - buy_price) / buy_price * 100 - cost_pct, 2)
     elif result["hit_stop_loss"]:
         result["outcome"] = "止损"
-        result["realized_pct"] = round((stop_loss - buy_price) / buy_price * 100, 2)
+        result["realized_pct"] = round((stop_loss - buy_price) / buy_price * 100 - cost_pct, 2)
     else:
         if end_price >= buy_price:
             result["outcome"] = "浮盈（未触达目标/止损）"

@@ -10,7 +10,6 @@ import random
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from BBBIG.data_fetcher import fetcher
 from BBBIG.deepseek_client import deepseek
@@ -230,36 +229,56 @@ def _multifactor_score(row: pd.Series, indicators: dict, hot_industries: set) ->
         trend_score -= 3
     score += trend_score * weights.get("trend", 3.0)
 
-    # 2. 动量因子: 近5日涨幅2%~8%最佳, 超过10%减分
+    # 2. 动量因子: 区分"健康回调"和"趋势破坏"
+    #    上涨趋势中的小幅回调是好的买入时机
     chg_5d = indicators.get('chg_5d', 0)
-    if 2 <= chg_5d <= 8:
-        momentum_score = 8
+    ma_bull = indicators.get('ma_bull', False)
+    if -5 <= chg_5d < -1 and ma_bull:
+        momentum_score = 8  # 多头排列中的回调（洗盘买点）
+    elif 2 <= chg_5d <= 6:
+        momentum_score = 6  # 温和上涨
     elif 0 <= chg_5d < 2:
-        momentum_score = 4
-    elif 8 < chg_5d <= 12:
-        momentum_score = 3
-    elif chg_5d > 12:
-        momentum_score = -2  # 短期涨幅过大
-    elif -3 <= chg_5d < 0:
-        momentum_score = 2  # 小幅回调
+        momentum_score = 5  # 横盘企稳
+    elif -1 <= chg_5d < 0:
+        momentum_score = 4  # 微幅回调
+    elif 6 < chg_5d <= 10:
+        momentum_score = 2  # 涨幅偏大
+    elif -5 <= chg_5d < -1 and not ma_bull:
+        momentum_score = 0  # 非多头趋势下的回调
+    elif chg_5d > 10:
+        momentum_score = -3  # 短期涨幅过大，追高风险
     else:
-        momentum_score = -3  # 大跌
-    score += momentum_score * weights.get("momentum", 2.5)
+        momentum_score = -4  # 大跌(>5%)
+    score += momentum_score * weights.get("momentum", 2.0)
 
-    # 3. 量能因子: 近3日放量(1.2~2.5倍)加分, 极端放量减分
+    # 3. 量能因子: 结合价格位置判断放量含义
     vol_trend = indicators.get('vol_trend', 1.0)
-    if 1.2 <= vol_trend <= 2.5:
-        vol_score = 8
-    elif 1.0 <= vol_trend < 1.2:
-        vol_score = 3
-    elif vol_trend > 2.5:
-        vol_score = 1  # 极端放量需警惕
-    else:
-        vol_score = -2  # 缩量
-    # 量价配合加分
     vp_corr = indicators.get('vol_price_corr', 0)
-    if vp_corr > 0.3:
-        vol_score += 3  # 量价正相关（涨时放量）
+    dist_high = indicators.get('dist_high_20d', 0)
+
+    if vol_trend < 1.0 and ma_bull:
+        vol_score = 5   # 上涨趋势中缩量回调（洗盘信号，正面）
+    elif 1.2 <= vol_trend <= 2.5 and vp_corr > 0.2:
+        vol_score = 8   # 温和放量+量价正相关（健康上涨）
+    elif 1.2 <= vol_trend <= 2.5 and dist_high > -3:
+        vol_score = 2   # 高位放量（可能冲顶出货）
+    elif 1.2 <= vol_trend <= 2.5:
+        vol_score = 6   # 一般性放量
+    elif 1.0 <= vol_trend < 1.2:
+        vol_score = 3   # 平量
+    elif vol_trend > 2.5 and dist_high > -5:
+        vol_score = -2  # 高位极端放量（主力出货信号）
+    elif vol_trend > 2.5:
+        vol_score = 1   # 低位极端放量（可能见底放量）
+    elif vol_trend < 0.6:
+        vol_score = -1  # 严重缩量（流动性不足）
+    else:
+        vol_score = 0   # 非多头趋势下缩量
+    # 量价背离惩罚: 价涨量缩或价跌量增
+    if chg_5d > 2 and vp_corr < -0.3:
+        vol_score -= 3  # 价涨量缩=量价背离
+    elif chg_5d < -2 and vp_corr > 0.3:
+        vol_score -= 2  # 价跌量增=抛压加重
     score += vol_score * weights.get("volume", 2.0)
 
     # 4. 换手率因子: 3%~10%最佳
@@ -276,40 +295,52 @@ def _multifactor_score(row: pd.Series, indicators: dict, hot_industries: set) ->
         turnover_score = 0
     score += turnover_score * weights.get("turnover", 1.5)
 
-    # 5. 估值因子: PE 10~50 且 PB < 8 为合理
+    # 5. 估值因子: PE/PB 合理性（权重已提升到2.0）
     pe = row.get('市盈率动', 0)
     pb = row.get('市净率', 0)
     value_score = 0
-    if 10 <= pe <= 30:
-        value_score += 5
-    elif 30 < pe <= 50:
-        value_score += 2
-    elif pe > 80:
-        value_score -= 3
-    if 0 < pb < 3:
+    if 10 <= pe <= 25:
+        value_score += 6
+    elif 25 < pe <= 40:
         value_score += 3
-    elif 3 <= pb < 8:
-        value_score += 1
-    elif pb >= 8:
+    elif 40 < pe <= 60:
+        value_score += 0
+    elif pe > 80:
+        value_score -= 5  # 高估值严厉惩罚
+    elif 60 < pe <= 80:
         value_score -= 2
-    score += value_score * weights.get("value", 1.0)
+    if 0 < pb < 2:
+        value_score += 4
+    elif 2 <= pb < 4:
+        value_score += 2
+    elif 4 <= pb < 8:
+        value_score += 0
+    elif pb >= 8:
+        value_score -= 3
+    # 大市值龙头加分
+    total_mv = row.get('总市值', 0)
+    if total_mv >= 500e8:
+        value_score += 2  # 市值>500亿的龙头加分
+    score += value_score * weights.get("value", 2.0)
 
     # 6. 板块热度因子: 属于主力净流入TOP行业加分
     industry = row.get('所处行业', '')
     if industry in hot_industries:
         score += 8 * weights.get("sector_hot", 2.0)
 
-    # 7. 追高惩罚: 距20日最高点越近越减分
-    dist_high = indicators.get('dist_high_20d', 0)  # 负值表示低于最高点
-    if dist_high > -2:  # 距最高点不到2%
-        chase_penalty = 8
-    elif dist_high > -5:
+    # 7. 追高惩罚: 距20日最高点越近越减分（权重已加大到-2.5）
+    dist_high_factor = indicators.get('dist_high_20d', 0)  # 负值表示低于最高点
+    if dist_high_factor > -1:  # 距最高点不到1%（几乎在顶部）
+        chase_penalty = 10
+    elif dist_high_factor > -3:
+        chase_penalty = 7
+    elif dist_high_factor > -5:
         chase_penalty = 4
-    elif dist_high > -10:
+    elif dist_high_factor > -10:
         chase_penalty = 1
     else:
         chase_penalty = 0
-    score += chase_penalty * weights.get("anti_chase", -1.5)
+    score += chase_penalty * weights.get("anti_chase", -2.5)
 
     # 8. KDJ / RSI 辅助
     rsi = indicators.get('rsi', 50)
@@ -332,13 +363,16 @@ def _multifactor_score(row: pd.Series, indicators: dict, hot_industries: set) ->
 
 def _check_market_risk() -> dict:
     """
-    检查大盘风险状态
-    返回: {"risk_level": "低/中/高", "index_chg_5d": float, "index_above_ma20": bool, "warning": str}
+    检查大盘风险状态（增强版）
+    综合：指数MA20、5日涨跌幅、涨跌停家数比
+    返回: {"risk_level": "低/中/高/极高", "suggest_empty": bool, ...}
     """
-    result = {"risk_level": "低", "index_chg_5d": 0.0, "index_above_ma20": True, "warning": ""}
+    result = {
+        "risk_level": "低", "index_chg_5d": 0.0, "index_above_ma20": True,
+        "warning": "", "suggest_empty": False, "limit_up_ratio": 0.0
+    }
 
     try:
-        # 获取上证指数K线 (000001.SH → 用 399001 深证成指 or 000300 沪深300)
         index_kline = fetcher.fetch_stock_kline("000300", days=30)
         if index_kline.empty or len(index_kline) < 5:
             result["warning"] = "无法获取大盘指数数据，跳过风控检查"
@@ -357,11 +391,41 @@ def _check_market_risk() -> dict:
         else:
             result["index_above_ma20"] = True
 
-        # 风险等级判断
-        if chg_5d < MARKET_RISK_THRESHOLD and not result["index_above_ma20"]:
+        # 涨跌停家数比（用全市场行情估算）
+        try:
+            all_stocks = fetcher.fetch_all_stocks()
+            if not all_stocks.empty:
+                limit_up = len(all_stocks[all_stocks['涨跌幅'] >= 9.5])
+                limit_down = len(all_stocks[all_stocks['涨跌幅'] <= -9.5])
+                total = len(all_stocks)
+                result["limit_up_count"] = limit_up
+                result["limit_down_count"] = limit_down
+                if total > 0:
+                    result["limit_up_ratio"] = round(limit_up / total * 100, 2)
+                    result["limit_down_ratio"] = round(limit_down / total * 100, 2)
+        except Exception:
+            pass
+
+        # 风险等级判断（多条件综合）
+        risk_score = 0
+        if chg_5d < MARKET_RISK_THRESHOLD:
+            risk_score += 2
+        if not result["index_above_ma20"]:
+            risk_score += 1
+        if result.get("limit_down_count", 0) > result.get("limit_up_count", 0) * 2:
+            risk_score += 2  # 跌停数远超涨停数
+        if chg_5d < -5:
+            risk_score += 2  # 大盘暴跌
+
+        if risk_score >= 5:
+            result["risk_level"] = "极高"
+            result["suggest_empty"] = True
+            result["warning"] = (f"大盘近5日跌{chg_5d:.1f}%，跌停{result.get('limit_down_count',0)}家"
+                                 f">>涨停{result.get('limit_up_count',0)}家，建议空仓观望")
+        elif risk_score >= 3:
             result["risk_level"] = "高"
             result["warning"] = f"大盘近5日跌{chg_5d:.1f}%且跌破MA20，市场高风险"
-        elif chg_5d < MARKET_RISK_THRESHOLD or not result["index_above_ma20"]:
+        elif risk_score >= 1:
             result["risk_level"] = "中"
             result["warning"] = f"大盘近5日涨跌{chg_5d:+.1f}%，风险中等"
         else:
@@ -503,6 +567,67 @@ def _apply_industry_limit(recommendations: list, max_per_industry: int = MAX_SAM
     return filtered
 
 
+def _validate_ai_recommendations(recs: list) -> list:
+    """
+    校验 AI 输出的推荐合理性，修正异常值
+    - 止损价必须低于买入区间下沿
+    - 目标价必须高于买入区间上沿
+    - 各价格必须为正数
+    """
+    import re
+
+    def _parse_p(val):
+        if isinstance(val, (int, float)):
+            return float(val)
+        if isinstance(val, str):
+            nums = re.findall(r"[\d.]+", val)
+            return float(nums[0]) if nums else 0
+        return 0
+
+    def _parse_range(val):
+        if isinstance(val, str):
+            nums = re.findall(r"[\d.]+", val)
+            if len(nums) >= 2:
+                return float(nums[0]), float(nums[1])
+            elif len(nums) == 1:
+                p = float(nums[0])
+                return p * 0.98, p * 1.02
+        return 0, 0
+
+    validated = []
+    for rec in recs:
+        buy_low, buy_high = _parse_range(rec.get("suggested_buy_range", ""))
+        target = _parse_p(rec.get("target_price", 0))
+        stop = _parse_p(rec.get("stop_loss", 0))
+        current = _parse_p(rec.get("current_price", 0))
+
+        # 如果价格不合理，用当前价自动修正
+        if current > 0:
+            if buy_low <= 0 or buy_high <= 0:
+                buy_low = round(current * 0.97, 2)
+                buy_high = round(current * 1.01, 2)
+                rec["suggested_buy_range"] = f"{buy_low}-{buy_high}"
+
+            if target <= buy_high and target > 0:
+                target = round(current * 1.06, 2)
+                rec["target_price"] = target
+                logger.debug(f"[校验] {rec.get('code','')}: 目标价低于买入上沿，已修正为 {target}")
+
+            if stop >= buy_low and stop > 0:
+                stop = round(current * 0.94, 2)
+                rec["stop_loss"] = stop
+                logger.debug(f"[校验] {rec.get('code','')}: 止损价高于买入下沿，已修正为 {stop}")
+
+            if target <= 0:
+                rec["target_price"] = round(current * 1.06, 2)
+            if stop <= 0:
+                rec["stop_loss"] = round(current * 0.94, 2)
+
+        validated.append(rec)
+
+    return validated
+
+
 # ========== 主流程 ==========
 
 def run_stock_selection() -> dict:
@@ -528,6 +653,12 @@ def run_stock_selection() -> dict:
     if market_risk["risk_level"] == "高":
         logger.warning(f"⚠ {market_risk['warning']}")
         logger.warning("市场高风险，将减少推荐数量并提示风险")
+    elif market_risk.get("suggest_empty"):
+        logger.warning(f"🔴 {market_risk['warning']}")
+        logger.warning("市场极高风险，建议今日空仓观望")
+        result["analysis"] = market_risk["warning"]
+        result["recommendations"] = []
+        return result
 
     # Step 2: 获取行业和概念板块资金流向
     logger.info("[2/6] 获取板块资金流向...")
@@ -757,6 +888,8 @@ def run_stock_selection() -> dict:
             recs = analysis_result["recommendations"]
             # 应用行业集中度限制
             recs = _apply_industry_limit(recs, MAX_SAME_INDUSTRY)
+            # AI 输出合理性校验
+            recs = _validate_ai_recommendations(recs)
             result["recommendations"] = recs
             result["analysis"] = analysis_result.get("market_analysis", "")
             result["market_risk_assessment"] = analysis_result.get("market_risk_assessment", "")

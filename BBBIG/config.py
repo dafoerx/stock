@@ -34,14 +34,19 @@ MIN_VOLUME = 1e8  # 最小成交额 1亿
 
 # ========== 多因子评分权重 ==========
 FACTOR_WEIGHTS = {
-    "trend": 3.0,        # 趋势因子（MA多头排列）
-    "momentum": 2.5,     # 动量因子（近5日涨幅适中）
+    "trend": 2.5,        # 趋势因子（MA多头排列）
+    "momentum": 2.0,     # 动量因子（近5日涨幅适中）
     "volume": 2.0,       # 量能因子（近3日放量）
     "turnover": 1.5,     # 换手率因子
-    "value": 1.0,        # 估值因子（PE/PB合理性）
+    "value": 2.0,        # 估值因子（PE/PB合理性）— 提高权重
     "sector_hot": 2.0,   # 板块热度因子（所属行业资金流入）
-    "anti_chase": -1.5,  # 追高惩罚（距20日高点过近）
+    "anti_chase": -2.5,  # 追高惩罚（距20日高点过近）— 加大惩罚
 }
+
+# ========== 交易成本 ==========
+COMMISSION_RATE = 0.0003   # 佣金费率（买卖各万三）
+STAMP_TAX_RATE = 0.001     # 印花税（卖出千一）
+TOTAL_TRADE_COST = COMMISSION_RATE * 2 + STAMP_TAX_RATE  # 单次买卖总成本约 0.16%
 
 # ========== 风控参数 ==========
 MAX_SAME_INDUSTRY = 3       # 同行业最多推荐数量

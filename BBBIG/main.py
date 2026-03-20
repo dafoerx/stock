@@ -49,7 +49,6 @@ def setup_logging():
 class _SafeEncoder(json.JSONEncoder):
     """兼容 numpy/pandas bool_、int64、float64 等类型的 JSON 编码器"""
     def default(self, obj):
-        import numpy as np
         if isinstance(obj, (np.bool_,)):
             return bool(obj)
         if isinstance(obj, (np.integer,)):
@@ -240,12 +239,31 @@ BBBIG - A股智能选股与持仓分析系统
 """)
 
 
+def _check_env():
+    """启动时检查必要的环境变量"""
+    from BBBIG.config import DEEPSEEK_API_KEY, TUSHARE_TOKEN
+    missing = []
+    if not DEEPSEEK_API_KEY:
+        missing.append("DEEPSEEK_API_KEY")
+    if not TUSHARE_TOKEN:
+        missing.append("TUSHARE_TOKEN")
+    if missing:
+        print(f"错误: 请设置环境变量: {', '.join(missing)}")
+        print("示例: export DEEPSEEK_API_KEY=sk-xxx && export TUSHARE_TOKEN=xxx")
+        sys.exit(1)
+
+
 def main():
     setup_logging()
 
     if len(sys.argv) < 2:
         print_usage()
         return
+
+    # 需要 API 的命令，启动前校验环境变量
+    cmd = sys.argv[1].lower()
+    if cmd in ("select", "analyze", "run", "serve", "backtest", "qbacktest", "simulate"):
+        _check_env()
 
     command = sys.argv[1].lower()
     args = sys.argv[2:]
