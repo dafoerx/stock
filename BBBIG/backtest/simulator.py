@@ -279,6 +279,10 @@ class BBBIGSimulator:
         self._stop_loss_dates: dict[str, str] = {}
         self.COOLDOWN_DAYS = 10  # 止损后N个交易日内不再买入同一只
 
+        # 跨周补仓：上周末卖出后的待补仓选股结果
+        self._pending_refill_recs: Optional[list] = None
+        self._pending_refill_budget: float = 0.0
+
     # -------- 净值计算 --------
 
     def _total_assets(self) -> float:
@@ -442,10 +446,18 @@ class BBBIGSimulator:
         actual_high = min(buy_high, day_high)
         exec_price  = round((actual_low + actual_high) / 2, 3)
 
-        # 按推荐仓位比例计算资金
-        rec_position_pct = float(rec.get("position_pct", rec.get("position", 0.08)))
+        # 按推荐仓位比例计算资金（兼容多种字段名）
+        raw_pos = rec.get("position_weight",
+                          rec.get("position_pct",
+                                  rec.get("position", "8%")))
+        # 解析百分比字符串或数字
+        if isinstance(raw_pos, str):
+            nums = re.findall(r"[\d.]+", raw_pos)
+            rec_position_pct = float(nums[0]) if nums else 8.0
+        else:
+            rec_position_pct = float(raw_pos)
         if rec_position_pct > 1:
-            rec_position_pct /= 100  # 兼容 "8" 和 "0.08" 两种格式
+            rec_position_pct /= 100  # 兼容 "15"/"15%" 和 "0.15" 格式
         alloc_cash = available_cash * rec_position_pct
         if alloc_cash < exec_price * 100:  # 至少买1手(100股)
             alloc_cash = min(available_cash, exec_price * 200)
@@ -592,17 +604,63 @@ class BBBIGSimulator:
             # 3. 次日（选股日后第一个交易日）尝试买入
             buy_date = _next_trade_date(selection_date)
             if buy_date <= today:
+                # 优先处理上周末遗留的补仓买入
+                if self._pending_refill_recs is not None:
+                    logger.info(f"  [{buy_date}] 执行上周遗留补仓买入")
+                    self._buy_from_selections(
+                        self._pending_refill_recs, buy_date,
+                        self._pending_refill_budget)
+                    self._pending_refill_recs = None
+                    self._pending_refill_budget = 0.0
+                    # 重新计算可建仓资金
+                    total_budget = self._total_assets() * self._position_ratio(current_risk)
+                    current_mv = sum(p.market_value for p in self.positions.values())
+                    available_for_buy = max(0.0, total_budget - current_mv)
+
                 self._buy_from_selections(recs, buy_date, available_for_buy)
 
-            # 4. 本周逐日检查止损/目标价
-            for trade_date in week_dates:
+            # 4. 本周逐日检查止损/目标价，卖出后触发补仓选股
+            for j, trade_date in enumerate(week_dates):
                 if trade_date <= buy_date:
                     continue  # 买入日当天不再检查（避免同日买卖）
                 if trade_date > today:
                     break
+
+                # 如果前一日触发卖出产生了补仓选股结果，今天尝试买入
+                if self._pending_refill_recs is not None:
+                    logger.info(f"  [{trade_date}] 补仓买入（基于前日卖出后选股）")
+                    self._buy_from_selections(
+                        self._pending_refill_recs, trade_date,
+                        self._pending_refill_budget)
+                    self._pending_refill_recs = None
+                    self._pending_refill_budget = 0.0
+
                 exited = self._check_exits(trade_date)
                 if exited:
                     logger.info(f"  [{trade_date}] 触发卖出: {exited}")
+                    # 卖出释放了仓位，触发补仓选股
+                    refill_budget = self._total_assets() * self._position_ratio(current_risk)
+                    refill_mv = sum(p.market_value for p in self.positions.values())
+                    refill_available = max(0.0, refill_budget - refill_mv)
+                    if refill_available >= 1000:
+                        logger.info(f"  [{trade_date}] 仓位空缺 {refill_available:,.0f}元，"
+                                    f"触发补仓选股...")
+                        refill_recs, current_risk = self._run_weekly_selection(
+                            trade_date, current_risk)
+                        # 过滤掉已持有和刚卖出的股票
+                        refill_recs = [r for r in refill_recs
+                                       if r.get("code", "") not in self.positions
+                                       and r.get("code", "") not in exited]
+                        if refill_recs:
+                            self._pending_refill_recs = refill_recs
+                            self._pending_refill_budget = refill_available
+                            logger.info(f"  [{trade_date}] 补仓候选 {len(refill_recs)} 只，"
+                                        f"次日买入")
+                        else:
+                            logger.info(f"  [{trade_date}] 补仓选股无合适候选")
+
+            # 跨周补仓：如果本周最后一天卖出产生的补仓选股结果
+            # 保留在 self._pending_refill_recs 中，下周初自动处理
 
             # 5. 周末盯市净值快照
             week_last = week_dates[-1] if week_dates[-1] <= today else today
