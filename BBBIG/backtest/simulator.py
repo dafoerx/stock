@@ -18,7 +18,7 @@ import random
 import time
 import sqlite3
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -383,17 +383,18 @@ class BBBIGSimulator:
 
     # -------- 买入逻辑 --------
 
-    def _try_buy(self, rec: dict, buy_date: str, available_cash: float) -> bool:
+    def _try_buy(self, rec: dict, buy_date: str,
+                 total_budget: float, remaining_budget: float) -> Tuple[bool, float]:
         """
         尝试在 buy_date 以推荐买入区间成交。
         当日实际价格（开盘~收盘范围）与区间有交集才成交。
         成交价取 min(buy_high, 当日最高价) 与 max(buy_low, 当日最低价) 的中值。
-        :return: True=成交, False=未成交
+        :return: (是否成交, 实际占用预算)
         """
         code = rec.get("code", "")
         name = rec.get("name", code)
         if code in self.positions:
-            return False  # 已持有
+            return False, 0.0  # 已持有
 
         # Bug2修复：检查止损冷静期
         if code in self._stop_loss_dates:
@@ -403,12 +404,12 @@ class BBBIGSimulator:
             days_since = len(all_dates_after) - 1  # 不含止损日本身
             if days_since < self.COOLDOWN_DAYS:
                 logger.info(f"  [{buy_date}] {code} {name} 止损冷静期中（已{days_since}天，需{self.COOLDOWN_DAYS}天），跳过")
-                return False
+                return False, 0.0
 
         buy_low, buy_high = _parse_buy_range(rec.get("suggested_buy_range", ""))
         if buy_low <= 0 or buy_high <= 0:
             logger.debug(f"  {code} 买入区间无效，跳过")
-            return False
+            return False, 0.0
 
         target = _parse_price(rec.get("target_price", 0))
         stop   = _parse_price(rec.get("stop_loss", 0))
@@ -416,7 +417,7 @@ class BBBIGSimulator:
         kline = _get_kline_for_date_range(code, buy_date, buy_date)
         if kline.empty:
             logger.debug(f"  {code} {buy_date} 无K线数据，跳过")
-            return False
+            return False, 0.0
 
         row = kline.iloc[0]
         day_low  = float(row["最低"])
@@ -426,12 +427,17 @@ class BBBIGSimulator:
         if day_high < buy_low or day_low > buy_high:
             logger.info(f"  [{buy_date}] {code} {name} 价格 [{day_low:.2f},{day_high:.2f}] "
                         f"未落入买入区间 [{buy_low:.2f},{buy_high:.2f}]，跳过")
-            return False
+            return False, 0.0
 
         # 成交价：区间与当日K线的交集中点
         actual_low  = max(buy_low,  day_low)
         actual_high = min(buy_high, day_high)
         exec_price  = round((actual_low + actual_high) / 2, 3)
+
+        budget_cap = min(max(remaining_budget, 0.0), self.cash)
+        if budget_cap <= 0:
+            logger.info(f"  [{buy_date}] {code} {name} 无剩余预算，跳过")
+            return False, 0.0
 
         # 按推荐仓位比例计算资金（兼容多种字段名）
         raw_pos = rec.get("position_weight",
@@ -445,22 +451,24 @@ class BBBIGSimulator:
             rec_position_pct = float(raw_pos)
         if rec_position_pct > 1:
             rec_position_pct /= 100  # 兼容 "15"/"15%" 和 "0.15" 格式
-        alloc_cash = available_cash * rec_position_pct
-        if alloc_cash < exec_price * 100:  # 至少买1手(100股)
-            alloc_cash = min(available_cash, exec_price * 200)
+
+        target_cash = total_budget * rec_position_pct
+        alloc_cash = min(target_cash, budget_cap)
+        min_lot_cost = _calc_buy_cost(exec_price, 100)
+        if alloc_cash < min_lot_cost:
+            if budget_cap < min_lot_cost:
+                logger.info(f"  [{buy_date}] {code} {name} 剩余预算 {budget_cap:.2f}元，不足买入1手，跳过")
+                return False, 0.0
+            alloc_cash = min_lot_cost
 
         shares = int(alloc_cash / exec_price / 100) * 100  # 取整到100股
+        while shares > 0 and _calc_buy_cost(exec_price, shares) > budget_cap:
+            shares -= 100
         if shares <= 0:
-            logger.debug(f"  {code} 资金不足，无法买入")
-            return False
+            logger.info(f"  [{buy_date}] {code} {name} 剩余预算 {budget_cap:.2f}元，无法买入整手")
+            return False, 0.0
 
         cost = _calc_buy_cost(exec_price, shares)
-        if cost > self.cash:
-            shares = int(self.cash / exec_price / 1.003 / 100) * 100
-            if shares <= 0:
-                return False
-            cost = _calc_buy_cost(exec_price, shares)
-
         self.cash -= cost
         pos = Position(
             code=code, name=name,
@@ -476,8 +484,9 @@ class BBBIGSimulator:
             "cost": cost, "target": target, "stop": stop,
         })
         logger.info(f"  [{buy_date}] 买入 {code} {name} @ {exec_price:.2f} × {shares}股 "
-                    f"= {cost:.2f}元 | 目标{target:.2f} 止损{stop:.2f}")
-        return True
+                    f"= {cost:.2f}元 | 目标{target:.2f} 止损{stop:.2f} | "
+                    f"本轮预算剩余 {max(remaining_budget - cost, 0.0):.2f}元")
+        return True, cost
 
     # -------- 每周选股 + 建仓 --------
 
@@ -513,8 +522,9 @@ class BBBIGSimulator:
         """
         仅对回测排序靠前的候选尝试建仓，避免后排股票因为更容易跌入区间而被动成交。
         若某只未成交（价格未入区间），自动顺延尝试下一只备选。
+        每次成交后实时扣减本轮预算，避免多只股票重复占用同一笔可建仓资金。
         """
-        if not recs:
+        if not recs or total_budget <= 0:
             return
 
         ranked_recs = sorted(
@@ -522,22 +532,26 @@ class BBBIGSimulator:
             key=lambda r: int(r.get("rank", 10**9)) if str(r.get("rank", "")).isdigit() else 10**9
         )
         tradable_recs = ranked_recs[:self.MAX_BUY_RANK] if self.MAX_BUY_RANK > 0 else ranked_recs
-        logger.info(f"  [{buy_date}] 仅尝试前{self.MAX_BUY_RANK}名候选建仓（本次候选 {len(tradable_recs)}/{len(recs)}）")
+        remaining_budget = min(total_budget, self.cash)
+        logger.info(f"  [{buy_date}] 仅尝试前{self.MAX_BUY_RANK}名候选建仓（本次候选 {len(tradable_recs)}/{len(recs)}），"
+                    f"初始预算 {remaining_budget:.2f}元")
 
         bought = 0
         for rec in tradable_recs:
             code = rec.get("code", "")
             if code in self.positions:
                 continue
-            if self.cash < 1000:
-                logger.info(f"  [{buy_date}] 可用资金不足1000元，停止建仓")
+            if remaining_budget <= 0 or self.cash <= 0:
+                logger.info(f"  [{buy_date}] 本轮预算已用尽，停止建仓")
                 break
-            ok = self._try_buy(rec, buy_date, total_budget)
+            ok, spent = self._try_buy(rec, buy_date, total_budget, remaining_budget)
             if ok:
                 bought += 1
+                remaining_budget = max(0.0, remaining_budget - spent)
 
-        logger.info(f"  [{buy_date}] 本周建仓 {bought} 只，持仓 {len(self.positions)} 只，"
-                    f"剩余现金 {self.cash:.2f}元")
+        used_budget = max(0.0, total_budget - remaining_budget)
+        logger.info(f"  [{buy_date}] 本周建仓 {bought} 只，已用预算 {used_budget:.2f}元 / {total_budget:.2f}元，"
+                    f"持仓 {len(self.positions)} 只，剩余现金 {self.cash:.2f}元")
 
     # -------- 主循环 --------
 
