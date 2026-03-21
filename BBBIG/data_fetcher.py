@@ -6,6 +6,7 @@
 """
 import time
 import logging
+import os
 import threading
 import tushare as ts
 import pandas as pd
@@ -118,6 +119,26 @@ class StockDataFetcher:
                 if db_cache.has_daily(d):
                     return d
         return dates[-1]
+
+    def _nearest_trade_date_before(self, date_str: str) -> str:
+        """将任意日期归一到不晚于该日期的最近交易日"""
+        self._ensure_trade_cal()
+        normalized = (date_str or '').replace('-', '')
+        if len(normalized) != 8 or not normalized.isdigit():
+            return normalized
+        target = datetime.strptime(normalized, '%Y%m%d')
+        start = (target - timedelta(days=30)).strftime('%Y%m%d')
+        dates = db_cache.get_trade_dates(start, normalized)
+        if dates:
+            return dates[-1]
+        return normalized
+
+    def _resolve_trade_date(self, trade_date: str = None) -> str:
+        """解析显式日期或回测环境变量，否则回退到最新交易日"""
+        requested = trade_date or os.environ.get('BBBIG_BACKTEST_DATE', '').strip()
+        if requested:
+            return self._nearest_trade_date_before(requested)
+        return self._get_latest_trade_date()
 
     # ========== 股票基础信息（缓存优先） ==========
 
@@ -239,7 +260,7 @@ class StockDataFetcher:
         """判断是否为A股"""
         return code.startswith(('600', '601', '603', '605', '000', '001', '002', '003', '300', '301'))
 
-    def fetch_all_stocks(self) -> pd.DataFrame:
+    def fetch_all_stocks(self, trade_date: str = None) -> pd.DataFrame:
         """
         获取全部A股实时行情
         返回列: 最新价, 涨跌幅, 涨跌额, 成交量, 成交额, 振幅, 换手率,
@@ -248,7 +269,7 @@ class StockDataFetcher:
                 所处行业, 每股收益, 每股净资产
         """
         try:
-            trade_date = self._get_latest_trade_date()
+            trade_date = self._resolve_trade_date(trade_date)
             if not trade_date:
                 return pd.DataFrame()
 
@@ -382,7 +403,7 @@ class StockDataFetcher:
             if end_date_str:
                 end_date = end_date_str
             else:
-                end_date = self._get_latest_trade_date()
+                end_date = self._resolve_trade_date()
                 if not end_date:
                     end_date = datetime.now().strftime('%Y%m%d')
 
@@ -462,7 +483,7 @@ class StockDataFetcher:
             logger.error(traceback.format_exc())
             return pd.DataFrame()
 
-    def fetch_hot_sectors(self) -> pd.DataFrame:
+    def fetch_hot_sectors(self, trade_date: str = None) -> pd.DataFrame:
         """
         获取行业板块资金流向
         优先使用 moneyflow_ind_ths（同花顺行业资金流），每日只调用一次后缓存到内存，
@@ -470,7 +491,7 @@ class StockDataFetcher:
         返回列: 板块名称, 涨跌幅, 主力净流入, 主力净流入占比
         """
         try:
-            trade_date = self._get_latest_trade_date()
+            trade_date = self._resolve_trade_date(trade_date)
             if not trade_date:
                 return pd.DataFrame()
 
@@ -522,13 +543,13 @@ class StockDataFetcher:
             logger.error(f"获取行业板块资金流异常: {e}")
             return pd.DataFrame()
 
-    def fetch_concept_sectors(self) -> pd.DataFrame:
+    def fetch_concept_sectors(self, trade_date: str = None) -> pd.DataFrame:
         """
         获取概念板块资金流向（缓存优先）
         返回列: 板块名称, 涨跌幅, 主力净流入, 主力净流入占比
         """
         try:
-            trade_date = self._get_latest_trade_date()
+            trade_date = self._resolve_trade_date(trade_date)
             if not trade_date:
                 return pd.DataFrame()
 

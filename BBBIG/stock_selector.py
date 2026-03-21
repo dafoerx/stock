@@ -5,6 +5,7 @@
 多因子预筛选 + 技术指标计算 + 板块联动 + 行业集中度控制 + 大盘风控 + AI评分框架
 """
 import logging
+import os
 import time
 import random
 import numpy as np
@@ -361,7 +362,7 @@ def _multifactor_score(row: pd.Series, indicators: dict, hot_industries: set) ->
 
 # ========== 大盘风控 ==========
 
-def _check_market_risk() -> dict:
+def _check_market_risk(as_of_date: str = None) -> dict:
     """
     检查大盘风险状态（增强版）
     综合：指数MA20、5日涨跌幅、涨跌停家数比
@@ -373,7 +374,7 @@ def _check_market_risk() -> dict:
     }
 
     try:
-        index_kline = fetcher.fetch_stock_kline("000300", days=30)
+        index_kline = fetcher.fetch_stock_kline("000300", days=30, end_date_str=as_of_date)
         if index_kline.empty or len(index_kline) < 5:
             result["warning"] = "无法获取大盘指数数据，跳过风控检查"
             return result
@@ -393,7 +394,7 @@ def _check_market_risk() -> dict:
 
         # 涨跌停家数比（用全市场行情估算）
         try:
-            all_stocks = fetcher.fetch_all_stocks()
+            all_stocks = fetcher.fetch_all_stocks(trade_date=as_of_date)
             if not all_stocks.empty:
                 limit_up = len(all_stocks[all_stocks['涨跌幅'] >= 9.5])
                 limit_down = len(all_stocks[all_stocks['涨跌幅'] <= -9.5])
@@ -528,7 +529,7 @@ def _prefilter_candidates(all_stocks: pd.DataFrame, kline_map: dict,
     return df.reset_index(drop=True), indicators_map
 
 
-def _fetch_kline_batch(codes: list, days: int = KLINE_DAYS) -> dict:
+def _fetch_kline_batch(codes: list, days: int = KLINE_DAYS, end_date_str: str = None) -> dict:
     """批量获取K线数据，限速防止 Tushare IP超限，单线程串行+重试"""
     kline_map = {}
     total = len(codes)
@@ -536,7 +537,7 @@ def _fetch_kline_batch(codes: list, days: int = KLINE_DAYS) -> dict:
         for attempt in range(3):  # 最多重试3次
             try:
                 time.sleep(random.uniform(0.15, 0.4))
-                kline = fetcher.fetch_stock_kline(code, days=days)
+                kline = fetcher.fetch_stock_kline(code, days=days, end_date_str=end_date_str)
                 if not kline.empty:
                     kline_map[code] = kline
                 break  # 成功则跳出重试
@@ -630,16 +631,27 @@ def _validate_ai_recommendations(recs: list) -> list:
 
 # ========== 主流程 ==========
 
-def run_stock_selection() -> dict:
+def run_stock_selection(selection_date: str = None) -> dict:
     """
     执行智能选股流程（优化版）
     返回: {"timestamp": ..., "hot_sectors": ..., "recommendations": [...], "analysis": "...",
            "market_risk": {...}}
     """
+    analysis_date = (selection_date or os.environ.get("BBBIG_BACKTEST_DATE", "") or "").strip()
+    analysis_date = analysis_date.replace('-', '') if analysis_date else None
+    analysis_date_display = (
+        datetime.strptime(analysis_date, "%Y%m%d").strftime("%Y-%m-%d")
+        if analysis_date else datetime.now().strftime("%Y-%m-%d")
+    )
+
     logger.info("=" * 60)
-    logger.info("开始执行智能选股（优化版）...")
+    if analysis_date:
+        logger.info(f"开始执行智能选股（优化版）... [基准日期: {analysis_date_display}]")
+    else:
+        logger.info("开始执行智能选股（优化版）...")
     result = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "selection_date": analysis_date_display,
         "hot_sectors": "",
         "recommendations": [],
         "analysis": "",
@@ -648,7 +660,7 @@ def run_stock_selection() -> dict:
 
     # Step 1: 大盘风控检查
     logger.info("[1/6] 大盘风控检查...")
-    market_risk = _check_market_risk()
+    market_risk = _check_market_risk(analysis_date)
     result["market_risk"] = market_risk
     if market_risk["risk_level"] == "高":
         logger.warning(f"⚠ {market_risk['warning']}")
@@ -662,8 +674,8 @@ def run_stock_selection() -> dict:
 
     # Step 2: 获取行业和概念板块资金流向
     logger.info("[2/6] 获取板块资金流向...")
-    hot_sectors = fetcher.fetch_hot_sectors()
-    concept_sectors = fetcher.fetch_concept_sectors()
+    hot_sectors = fetcher.fetch_hot_sectors(trade_date=analysis_date)
+    concept_sectors = fetcher.fetch_concept_sectors(trade_date=analysis_date)
 
     # 提取主力净流入TOP行业（用于多因子评分）
     hot_industries = set()
@@ -684,7 +696,7 @@ def run_stock_selection() -> dict:
 
     # Step 3: 获取全量A股行情
     logger.info("[3/6] 获取A股实时行情...")
-    all_stocks = fetcher.fetch_all_stocks()
+    all_stocks = fetcher.fetch_all_stocks(trade_date=analysis_date)
     if all_stocks.empty:
         logger.error("获取A股行情失败")
         result["analysis"] = "错误：无法获取A股行情数据"
@@ -710,7 +722,7 @@ def run_stock_selection() -> dict:
     rough_codes = rough_df["代码"].tolist()
     logger.info(f"  粗筛: 成交额TOP140 + 随机{len(random_60)}只 = {len(rough_codes)}只候选")
 
-    kline_map = _fetch_kline_batch(rough_codes, days=KLINE_DAYS)
+    kline_map = _fetch_kline_batch(rough_codes, days=KLINE_DAYS, end_date_str=analysis_date)
     logger.info(f"  成功获取 {len(kline_map)} 只股票K线")
 
     # 多因子预筛选
@@ -730,7 +742,7 @@ def run_stock_selection() -> dict:
     # 为还没有K线的候选股补充获取
     missing_codes = [c for c in candidates["代码"].tolist() if c not in kline_map]
     if missing_codes:
-        extra_klines = _fetch_kline_batch(missing_codes, days=KLINE_DAYS)
+        extra_klines = _fetch_kline_batch(missing_codes, days=KLINE_DAYS, end_date_str=analysis_date)
         kline_map.update(extra_klines)
 
     # Step 5: 构造增强版大模型 prompt
@@ -831,7 +843,7 @@ def run_stock_selection() -> dict:
 
     user_prompt = f"""请分析以下A股市场数据，从候选股票中选出最值得投资的前{effective_top_n}支股票。
 {risk_note}
-当前日期: {datetime.now().strftime('%Y-%m-%d')}
+当前日期: {analysis_date_display}
 
 {result['hot_sectors']}
 
@@ -906,7 +918,7 @@ def run_stock_selection() -> dict:
     if result["recommendations"]:
         logger.info("[6/6] 对推荐股票进行回测验证...")
         from BBBIG.backtester import backtest_stock_list
-        backtest_report = backtest_stock_list(result["recommendations"], weeks_list=[1, 2, 3])
+        backtest_report = backtest_stock_list(result["recommendations"], weeks_list=[1, 2, 3], reference_date=analysis_date)
         result["backtest_report"] = backtest_report
         if backtest_report.get("stock_results"):
             ranked_codes = [sr["code"] for sr in backtest_report["stock_results"]]

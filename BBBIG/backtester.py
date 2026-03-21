@@ -18,26 +18,29 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from BBBIG.data_fetcher import fetcher
 from BBBIG.deepseek_client import deepseek
-from BBBIG.config import TOP_N, KLINE_DAYS, RESULT_DIR, AI_TEMPERATURE, AI_MAX_TOKENS, TOTAL_TRADE_COST
+from BBBIG.config import TOP_N, KLINE_DAYS, RESULT_DIR, AI_TEMPERATURE, AI_MAX_TOKENS, TOTAL_TRADE_COST, STOP_LOSS_MODE
 
 import os
 
 logger = logging.getLogger("BBBIG")
 
 
-def _get_trade_date_before(weeks: int) -> str:
-    """获取 N 周前的最近交易日，优先用交易日历，回退到weekday判断"""
-    target = datetime.now() - timedelta(weeks=weeks)
+def _get_trade_date_before(weeks: int, reference_date: str = None) -> str:
+    """获取 reference_date 之前 N 周的最近交易日，未提供则以今天为基准"""
+    if reference_date:
+        base = datetime.strptime(reference_date.replace('-', ''), "%Y%m%d")
+    else:
+        base = datetime.now()
+    target = base - timedelta(weeks=weeks)
     target_str = target.strftime("%Y%m%d")
 
     # 优先使用交易日历
     try:
         from BBBIG.db_cache import db_cache
-        # 查找目标日期前后5天范围内的最近交易日
         start = (target - timedelta(days=10)).strftime("%Y%m%d")
         dates = db_cache.get_trade_dates(start, target_str)
         if dates:
-            return dates[-1]  # 取最近的交易日
+            return dates[-1]
     except Exception:
         pass
 
@@ -59,7 +62,7 @@ def _fetch_kline_for_backtest(code: str, analysis_date: str, days_before: int = 
     today_str = datetime.now().strftime("%Y%m%d")
     if future_end > today_str:
         future_end = today_str
-    full_df = fetcher.fetch_stock_kline(code, days=days_before + days_after + 20)
+    full_df = fetcher.fetch_stock_kline(code, days=days_before + days_after + 20, end_date_str=future_end)
     if full_df.empty or before_df.empty:
         return before_df, pd.DataFrame()
     after_df = full_df[full_df["日期"] > ref_date.strftime("%Y-%m-%d")].head(days_after)
@@ -133,7 +136,8 @@ def _parse_buy_range(val) -> tuple:
     return 0, 0
 
 
-def _evaluate_recommendation(rec: dict, after_df: pd.DataFrame, before_df: pd.DataFrame) -> dict:
+def _evaluate_recommendation(rec: dict, after_df: pd.DataFrame, before_df: pd.DataFrame,
+                             stop_loss_mode: str = STOP_LOSS_MODE) -> dict:
     """根据实际后续K线验证单只推荐股的表现"""
     result = {
         "code": rec.get("code", ""),
@@ -141,6 +145,7 @@ def _evaluate_recommendation(rec: dict, after_df: pd.DataFrame, before_df: pd.Da
         "suggested_buy_range": rec.get("suggested_buy_range", ""),
         "target_price": rec.get("target_price", ""),
         "stop_loss": rec.get("stop_loss", ""),
+        "stop_loss_mode": stop_loss_mode,
     }
 
     buy_low, buy_high = _parse_buy_range(rec.get("suggested_buy_range", ""))
@@ -171,46 +176,50 @@ def _evaluate_recommendation(rec: dict, after_df: pd.DataFrame, before_df: pd.Da
     result["max_price"] = max_price
     result["min_price"] = min_price
     result["end_price"] = end_price
-    # 扣除交易成本（买卖佣金+印花税，约0.16%）
-    cost_pct = TOTAL_TRADE_COST * 100  # 转为百分比
+    cost_pct = TOTAL_TRADE_COST * 100
     result["max_profit_pct"] = round((max_price - buy_price) / buy_price * 100 - cost_pct, 2)
     result["max_loss_pct"] = round((min_price - buy_price) / buy_price * 100 - cost_pct, 2)
     result["final_profit_pct"] = round((end_price - buy_price) / buy_price * 100 - cost_pct, 2)
 
-    result["hit_target"] = (max_price >= target) if target > 0 else False
-    result["hit_stop_loss"] = (min_price <= stop_loss) if stop_loss > 0 else False
+    target_hit = False
+    stop_hit = False
+    realized_pct = result["final_profit_pct"]
+    outcome = "浮盈（未触达目标/止损）" if end_price >= buy_price else "浮亏（未触达目标/止损）"
 
-    target_day = None
-    stop_day = None
-    for i, (_, row) in enumerate(after_df.iterrows()):
-        if target > 0 and row["最高"] >= target and target_day is None:
-            target_day = i
-        if stop_loss > 0 and row["最低"] <= stop_loss and stop_day is None:
-            stop_day = i
+    for _, row in after_df.iterrows():
+        high = float(row["最高"])
+        low = float(row["最低"])
+        close = float(row["收盘"])
 
-    if result["hit_target"] and result["hit_stop_loss"]:
-        if target_day is not None and stop_day is not None:
-            if target_day <= stop_day:
-                result["outcome"] = "盈利（先触达目标价）"
-                result["realized_pct"] = round((target - buy_price) / buy_price * 100 - cost_pct, 2)
-            else:
-                result["outcome"] = "止损（先触达止损价）"
-                result["realized_pct"] = round((stop_loss - buy_price) / buy_price * 100 - cost_pct, 2)
+        if target > 0 and high >= target:
+            target_hit = True
+            realized_pct = round((target - buy_price) / buy_price * 100 - cost_pct, 2)
+            outcome = "盈利（触达目标价）"
+            break
+
+        if stop_loss > 0:
+            if stop_loss_mode == "close_confirmed":
+                if close <= stop_loss:
+                    stop_hit = True
+                    realized_pct = round((close - buy_price) / buy_price * 100 - cost_pct, 2)
+                    outcome = "止损（收盘确认）"
+                    break
+            elif low <= stop_loss:
+                stop_hit = True
+                realized_pct = round((stop_loss - buy_price) / buy_price * 100 - cost_pct, 2)
+                outcome = "止损"
+                break
+
+    result["hit_target"] = target_hit or ((max_price >= target) if target > 0 else False)
+    if stop_loss > 0:
+        if stop_loss_mode == "close_confirmed":
+            result["hit_stop_loss"] = stop_hit or bool((after_df["收盘"] <= stop_loss).any())
         else:
-            result["outcome"] = "盈利（触达目标价）"
-            result["realized_pct"] = round((target - buy_price) / buy_price * 100 - cost_pct, 2)
-    elif result["hit_target"]:
-        result["outcome"] = "盈利（触达目标价）"
-        result["realized_pct"] = round((target - buy_price) / buy_price * 100 - cost_pct, 2)
-    elif result["hit_stop_loss"]:
-        result["outcome"] = "止损"
-        result["realized_pct"] = round((stop_loss - buy_price) / buy_price * 100 - cost_pct, 2)
+            result["hit_stop_loss"] = stop_hit or bool((after_df["最低"] <= stop_loss).any())
     else:
-        if end_price >= buy_price:
-            result["outcome"] = "浮盈（未触达目标/止损）"
-        else:
-            result["outcome"] = "浮亏（未触达目标/止损）"
-        result["realized_pct"] = result["final_profit_pct"]
+        result["hit_stop_loss"] = False
+    result["outcome"] = outcome
+    result["realized_pct"] = realized_pct
 
     kline_summary = []
     for _, row in after_df.iterrows():
@@ -233,7 +242,7 @@ def _quant_select_at_date(analysis_date: str, top_n: int = TOP_N) -> list:
     logger.info(f"[纯量化回测] 分析日期: {ref_date.strftime('%Y-%m-%d')}")
 
     # 获取当前活跃股列表
-    all_stocks = fetcher.fetch_all_stocks()
+    all_stocks = fetcher.fetch_all_stocks(trade_date=analysis_date)
     if all_stocks.empty:
         return []
 
@@ -314,7 +323,7 @@ def _quant_select_at_date(analysis_date: str, top_n: int = TOP_N) -> list:
     return filtered
 
 
-def run_quant_backtest(weeks_list: list = None) -> dict:
+def run_quant_backtest(weeks_list: list = None, reference_date: str = None) -> dict:
     """
     执行纯量化回测（不调AI，快速验证因子效果）
     :param weeks_list: 回测周数列表，默认 [1, 2, 3, 4]
@@ -342,7 +351,7 @@ def run_quant_backtest(weeks_list: list = None) -> dict:
     all_realized_pcts = []
 
     for weeks in weeks_list:
-        analysis_date = _get_trade_date_before(weeks)
+        analysis_date = _get_trade_date_before(weeks, reference_date=reference_date)
         ref_str = datetime.strptime(analysis_date, "%Y%m%d").strftime("%Y-%m-%d")
         logger.info(f"\n{'=' * 60}")
         logger.info(f"纯量化回测: {weeks}周前 (分析日: {ref_str})")
@@ -430,7 +439,7 @@ def _run_selection_at_date(analysis_date: str, candidate_codes: list = None) -> 
 
     if candidate_codes is None:
         logger.info("[回测] 获取当前活跃股列表作为候选池...")
-        all_stocks = fetcher.fetch_all_stocks()
+        all_stocks = fetcher.fetch_all_stocks(trade_date=analysis_date)
         if all_stocks.empty:
             return {"error": "获取A股行情失败"}
         from BBBIG.stock_selector import _prefilter_candidates
@@ -561,7 +570,7 @@ def _run_selection_at_date(analysis_date: str, candidate_codes: list = None) -> 
     }
 
 
-def run_backtest(weeks_list: list = None) -> dict:
+def run_backtest(weeks_list: list = None, reference_date: str = None) -> dict:
     """执行完整AI回测"""
     if weeks_list is None:
         weeks_list = [1, 2, 3]
@@ -585,7 +594,7 @@ def run_backtest(weeks_list: list = None) -> dict:
     all_realized_pcts = []
 
     for weeks in weeks_list:
-        analysis_date = _get_trade_date_before(weeks)
+        analysis_date = _get_trade_date_before(weeks, reference_date=reference_date)
         logger.info(f"\n{'=' * 60}")
         logger.info(f"回测第 {weeks} 周前 (分析日: {analysis_date})")
         logger.info("=" * 60)
@@ -648,7 +657,7 @@ def run_backtest(weeks_list: list = None) -> dict:
 
 # ========== 模式B: 推荐股回测 ==========
 
-def backtest_stock_list(stock_list: list, weeks_list: list = None) -> dict:
+def backtest_stock_list(stock_list: list, weeks_list: list = None, reference_date: str = None) -> dict:
     """对指定的股票列表进行多周回测验证"""
     if weeks_list is None:
         weeks_list = [1, 2, 3]
@@ -673,7 +682,7 @@ def backtest_stock_list(stock_list: list, weeks_list: list = None) -> dict:
         all_pcts = []
 
         for weeks in weeks_list:
-            analysis_date = _get_trade_date_before(weeks)
+            analysis_date = _get_trade_date_before(weeks, reference_date=reference_date)
             ref_date = datetime.strptime(analysis_date, "%Y%m%d")
             ref_str = ref_date.strftime("%Y-%m-%d")
 

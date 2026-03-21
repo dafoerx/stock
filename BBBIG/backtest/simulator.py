@@ -24,7 +24,7 @@ import numpy as np
 import pandas as pd
 
 from BBBIG.data_fetcher import fetcher
-from BBBIG.config import DB_FILE, RESULT_DIR, KLINE_DAYS
+from BBBIG.config import DB_FILE, RESULT_DIR, KLINE_DAYS, SIM_MAX_BUY_RANK, STOP_LOSS_MODE
 
 logger = logging.getLogger("BBBIG")
 
@@ -278,6 +278,8 @@ class BBBIGSimulator:
         # Bug2修复：止损冷静期记录 code -> 止损日期
         self._stop_loss_dates: dict[str, str] = {}
         self.COOLDOWN_DAYS = 10  # 止损后N个交易日内不再买入同一只
+        self.MAX_BUY_RANK = SIM_MAX_BUY_RANK
+        self.stop_loss_mode = STOP_LOSS_MODE
 
         # 跨周补仓：上周末卖出后的待补仓选股结果
         self._pending_refill_recs: Optional[list] = None
@@ -320,7 +322,8 @@ class BBBIGSimulator:
 
     def _check_exits(self, date_str: str) -> list:
         """
-        检查当日是否触达目标价或止损价，按"先到先得"逻辑处理。
+        检查当日是否触达目标价或止损价。
+        目标价仍按日内高点触发；止损支持收盘确认，避免被盘中下影线轻易洗出。
         返回已平仓的 code 列表。
         """
         exited = []
@@ -330,40 +333,25 @@ class BBBIGSimulator:
                 continue
             row = kline.iloc[0]
             high = float(row["最高"])
-            low  = float(row["最低"])
-            open_price = float(row["开盘"])
+            low = float(row["最低"])
+            close = float(row["收盘"])
+            pos.current_price = close
 
             hit_target = (pos.target_price > 0) and (high >= pos.target_price)
-            hit_stop   = (pos.stop_loss  > 0) and (low  <= pos.stop_loss)
+            if self.stop_loss_mode == "close_confirmed":
+                hit_stop = (pos.stop_loss > 0) and (close <= pos.stop_loss)
+            else:
+                hit_stop = (pos.stop_loss > 0) and (low <= pos.stop_loss)
 
             if not hit_target and not hit_stop:
-                # 盯市更新
-                pos.current_price = float(row["收盘"])
                 continue
 
-            # 判断先后：用开盘价判断当日跳空
-            if hit_target and hit_stop:
-                # 开盘跳空到目标价以上 → 先触目标
-                if open_price >= pos.target_price:
-                    sell_price = pos.target_price
-                    pos.status = "盈利卖出"
-                # 开盘跳空跌破止损 → 先触止损
-                elif open_price <= pos.stop_loss:
-                    sell_price = pos.stop_loss
-                    pos.status = "止损卖出"
-                else:
-                    # 开盘在区间内：高点先到 or 低点先到？
-                    # 通常用"涨跌幅"判断当日走势方向
-                    close = float(row["收盘"])
-                    if close >= open_price:
-                        sell_price = pos.target_price
-                        pos.status = "盈利卖出"
-                    else:
-                        sell_price = pos.stop_loss
-                        pos.status = "止损卖出"
-            elif hit_target:
+            if hit_target:
                 sell_price = pos.target_price
                 pos.status = "盈利卖出"
+            elif self.stop_loss_mode == "close_confirmed":
+                sell_price = close
+                pos.status = "止损卖出（收盘确认）"
             else:
                 sell_price = pos.stop_loss
                 pos.status = "止损卖出"
@@ -387,8 +375,7 @@ class BBBIGSimulator:
             del self.positions[code]
             exited.append(code)
 
-            # Bug2修复：记录止损冷静期
-            if pos.status == "止损卖出":
+            if pos.status.startswith("止损卖出"):
                 self._stop_loss_dates[code] = date_str
                 logger.info(f"  [{date_str}] {code} 进入止损冷静期（{self.COOLDOWN_DAYS}个交易日）")
 
@@ -502,8 +489,10 @@ class BBBIGSimulator:
         """
         from BBBIG.stock_selector import run_stock_selection
         logger.info(f"  [选股] 模拟 {selection_date} 的选股流程（真实AI选股）...")
+        prev_backtest_date = os.environ.get("BBBIG_BACKTEST_DATE")
+        os.environ["BBBIG_BACKTEST_DATE"] = selection_date
         try:
-            result = run_stock_selection()
+            result = run_stock_selection(selection_date=selection_date)
             recs = result.get("recommendations", [])
             # 如果大盘风险更新了，取最新的
             market_risk = result.get("market_risk", {})
@@ -514,20 +503,32 @@ class BBBIGSimulator:
         except Exception as e:
             logger.error(f"  [选股] 选股失败: {e}")
             return [], risk_level
+        finally:
+            if prev_backtest_date is None:
+                os.environ.pop("BBBIG_BACKTEST_DATE", None)
+            else:
+                os.environ["BBBIG_BACKTEST_DATE"] = prev_backtest_date
 
     def _buy_from_selections(self, recs: list, buy_date: str, total_budget: float):
         """
-        遍历推荐列表，尝试按仓位建仓。
+        仅对回测排序靠前的候选尝试建仓，避免后排股票因为更容易跌入区间而被动成交。
         若某只未成交（价格未入区间），自动顺延尝试下一只备选。
         """
         if not recs:
             return
 
+        ranked_recs = sorted(
+            recs,
+            key=lambda r: int(r.get("rank", 10**9)) if str(r.get("rank", "")).isdigit() else 10**9
+        )
+        tradable_recs = ranked_recs[:self.MAX_BUY_RANK] if self.MAX_BUY_RANK > 0 else ranked_recs
+        logger.info(f"  [{buy_date}] 仅尝试前{self.MAX_BUY_RANK}名候选建仓（本次候选 {len(tradable_recs)}/{len(recs)}）")
+
         bought = 0
-        for rec in recs:
+        for rec in tradable_recs:
             code = rec.get("code", "")
             if code in self.positions:
-                continue  # 已持有，跳过
+                continue
             if self.cash < 1000:
                 logger.info(f"  [{buy_date}] 可用资金不足1000元，停止建仓")
                 break

@@ -52,6 +52,8 @@ TOTAL_TRADE_COST = COMMISSION_RATE * 2 + STAMP_TAX_RATE  # 单次买卖总成本
 MAX_SAME_INDUSTRY = 3       # 同行业最多推荐数量
 INDEX_MA_DAYS = 20           # 大盘均线天数（用于判断牛熊）
 MARKET_RISK_THRESHOLD = -2.0 # 大盘近5日跌幅超此值视为高风险（%）
+SIM_MAX_BUY_RANK = int(os.environ.get("SIM_MAX_BUY_RANK", "5"))  # 模拟器仅交易回测前N名
+STOP_LOSS_MODE = os.environ.get("STOP_LOSS_MODE", "close_confirmed")  # close_confirmed / intraday
 
 # ========== AI 分析参数 ==========
 AI_TEMPERATURE = 0.1   # AI温度（越低越确定性）
