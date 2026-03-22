@@ -63,6 +63,17 @@ def _get_trade_dates_from_db(start_date: str, end_date: str) -> list:
         return result
 
 
+def _normalize_ts_code(code: str) -> str:
+    code = (code or "").strip().upper()
+    if not code:
+        return code
+    if '.' in code:
+        return code
+    if code.startswith(('5', '6', '9')):
+        return f"{code}.SH"
+    return f"{code}.SZ"
+
+
 def _nearest_trade_date_before(date_str: str) -> str:
     """返回不晚于 date_str 的最近交易日（含当日）"""
     try:
@@ -151,20 +162,17 @@ def _get_kline_for_date_range(code: str, start_date: str, end_date: str) -> pd.D
     """
     获取指定日期范围内的K线数据。
     优先从 SQLite 缓存读取，再 fallback 到 Tushare API。
-    返回的 DataFrame 含列: 日期(str YYYY-MM-DD), 开盘, 最高, 最低, 收盘, 成交量
+    返回的 DataFrame 含列: 日期(str YYYYMMDD), 开盘, 最高, 最低, 收盘, 成交量
     日期升序排列。
     """
     try:
         conn = sqlite3.connect(DB_FILE)
-        # 将 YYYYMMDD 转为 YYYY-MM-DD 用于 daily 表查询
-        sd = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:]}"
-        ed = f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:]}"
         df = pd.read_sql_query(
             "SELECT trade_date, open, high, low, close, vol "
             "FROM daily WHERE ts_code = ? AND trade_date >= ? AND trade_date <= ? "
             "ORDER BY trade_date ASC",
             conn,
-            params=(code if '.' in code else code + '.SZ', sd, ed)
+            params=(_normalize_ts_code(code), start_date, end_date)
         )
         conn.close()
         if not df.empty:
@@ -273,17 +281,26 @@ class BBBIGSimulator:
         self.nav_history: list[dict] = []          # 每周净值快照
 
         # 大盘风险 → 总仓位上限
-        self._risk_to_position = {"低": 0.80, "中": 0.60, "高": 0.30}
+        self._risk_to_position = {"低": 0.80, "中": 0.45, "高": 0.30}
 
-        # Bug2修复：止损冷静期记录 code -> 止损日期
+        # 个股止损冷静期：止损后N个交易日内不再买入同一只
         self._stop_loss_dates: dict[str, str] = {}
-        self.COOLDOWN_DAYS = 10  # 止损后N个交易日内不再买入同一只
+        self.COOLDOWN_DAYS = 10
+
+        # 策略级风控：止损后暂停补仓，且单周连续止损达到阈值后停止当周补仓
+        self.POST_STOP_LOSS_REFILL_COOLDOWN = 1   # 跳过1个完整交易日后再允许补仓
+        self.WEEKLY_STOP_LOSS_REFILL_LIMIT = 2    # 单周累计止损达到2笔后停止当周补仓
+        self._weekly_stop_loss_count = 0
+        self._weekly_refill_blocked = False
+
         self.MAX_BUY_RANK = SIM_MAX_BUY_RANK
         self.stop_loss_mode = STOP_LOSS_MODE
 
-        # 跨周补仓：上周末卖出后的待补仓选股结果
+        # 跨日/跨周补仓：卖出后的待补仓选股结果
         self._pending_refill_recs: Optional[list] = None
         self._pending_refill_budget: float = 0.0
+        self._pending_refill_buy_after: Optional[str] = None
+        self._pending_refill_reason: str = ""
 
     # -------- 净值计算 --------
 
@@ -309,7 +326,44 @@ class BBBIGSimulator:
     # -------- 大盘风险 → 仓位系数 --------
 
     def _position_ratio(self, risk_level: str) -> float:
-        return self._risk_to_position.get(risk_level, 0.60)
+        return self._risk_to_position.get(risk_level, 0.45)
+
+    def _trade_date_after(self, date_str: str, steps: int = 1) -> str:
+        result = date_str
+        for _ in range(max(steps, 0)):
+            result = _next_trade_date(result)
+        return result
+
+    def _clear_pending_refill(self):
+        self._pending_refill_recs = None
+        self._pending_refill_budget = 0.0
+        self._pending_refill_buy_after = None
+        self._pending_refill_reason = ""
+
+    def _schedule_refill(self, recs: list, budget: float, exit_date: str,
+                         cooldown_days: int, reason: str):
+        self._pending_refill_recs = recs
+        self._pending_refill_budget = budget
+        self._pending_refill_buy_after = self._trade_date_after(exit_date, cooldown_days + 1)
+        self._pending_refill_reason = reason
+        logger.info(f"  [{exit_date}] 补仓候选 {len(recs)} 只，{reason}，"
+                    f"最早 {self._pending_refill_buy_after} 买入")
+
+    def _process_pending_refill(self, trade_date: str):
+        if not self._pending_refill_recs:
+            return
+
+        buy_after = self._pending_refill_buy_after or trade_date
+        if trade_date < buy_after:
+            logger.info(f"  [{trade_date}] 补仓冷静期中，最早 {buy_after} 再尝试买入")
+            return
+
+        reason = self._pending_refill_reason or "基于前次卖出后选股"
+        logger.info(f"  [{trade_date}] 补仓买入（{reason}）")
+        self._buy_from_selections(
+            self._pending_refill_recs, trade_date,
+            self._pending_refill_budget)
+        self._clear_pending_refill()
 
     # -------- 每日盯市 + 卖出检查 --------
 
@@ -320,13 +374,14 @@ class BBBIGSimulator:
             if not kline.empty:
                 pos.current_price = float(kline.iloc[-1]["收盘"])
 
-    def _check_exits(self, date_str: str) -> list:
+    def _check_exits(self, date_str: str) -> Tuple[list, list]:
         """
         检查当日是否触达目标价或止损价。
         目标价仍按日内高点触发；止损支持收盘确认，避免被盘中下影线轻易洗出。
-        返回已平仓的 code 列表。
+        返回 (已平仓code列表, 止损卖出code列表)。
         """
         exited = []
+        stop_loss_exited = []
         for code, pos in list(self.positions.items()):
             kline = _get_kline_for_date_range(code, date_str, date_str)
             if kline.empty:
@@ -376,10 +431,11 @@ class BBBIGSimulator:
             exited.append(code)
 
             if pos.status.startswith("止损卖出"):
+                stop_loss_exited.append(code)
                 self._stop_loss_dates[code] = date_str
                 logger.info(f"  [{date_str}] {code} 进入止损冷静期（{self.COOLDOWN_DAYS}个交易日）")
 
-        return exited
+        return exited, stop_loss_exited
 
     # -------- 买入逻辑 --------
 
@@ -600,10 +656,15 @@ class BBBIGSimulator:
                 break
 
             week_idx += 1
+            self._weekly_stop_loss_count = 0
+            self._weekly_refill_blocked = False
             logger.info(f"\n{'='*60}")
             logger.info(f"第 {week_idx} 周 | 选股日: {selection_date} | "
                         f"周末: {week_dates[-1]}")
             logger.info(f"{'='*60}")
+            logger.info(f"  周内风控: 中风险仓位45% | 止损后补仓冷静期"
+                        f"{self.POST_STOP_LOSS_REFILL_COOLDOWN}个交易日 | "
+                        f"同周止损满{self.WEEKLY_STOP_LOSS_REFILL_LIMIT}笔停补")
 
             # 1. 运行本周选股
             recs, current_risk = self._run_weekly_selection(selection_date, current_risk)
@@ -621,13 +682,7 @@ class BBBIGSimulator:
             if buy_date <= today:
                 # 优先处理上周末遗留的补仓买入
                 if self._pending_refill_recs is not None:
-                    logger.info(f"  [{buy_date}] 执行上周遗留补仓买入")
-                    self._buy_from_selections(
-                        self._pending_refill_recs, buy_date,
-                        self._pending_refill_budget)
-                    self._pending_refill_recs = None
-                    self._pending_refill_budget = 0.0
-                    # 重新计算可建仓资金
+                    self._process_pending_refill(buy_date)
                     total_budget = self._total_assets() * self._position_ratio(current_risk)
                     current_mv = sum(p.market_value for p in self.positions.values())
                     available_for_buy = max(0.0, total_budget - current_mv)
@@ -641,38 +696,53 @@ class BBBIGSimulator:
                 if trade_date > today:
                     break
 
-                # 如果前一日触发卖出产生了补仓选股结果，今天尝试买入
-                if self._pending_refill_recs is not None:
-                    logger.info(f"  [{trade_date}] 补仓买入（基于前日卖出后选股）")
-                    self._buy_from_selections(
-                        self._pending_refill_recs, trade_date,
-                        self._pending_refill_budget)
-                    self._pending_refill_recs = None
-                    self._pending_refill_budget = 0.0
+                if self._pending_refill_recs is not None and not self._weekly_refill_blocked:
+                    self._process_pending_refill(trade_date)
 
-                exited = self._check_exits(trade_date)
+                exited, stop_loss_exited = self._check_exits(trade_date)
                 if exited:
                     logger.info(f"  [{trade_date}] 触发卖出: {exited}")
+
+                    if stop_loss_exited:
+                        self._weekly_stop_loss_count += len(stop_loss_exited)
+                        logger.info(f"  [{trade_date}] 本周累计止损 {self._weekly_stop_loss_count} 笔")
+                        if self._weekly_stop_loss_count >= self.WEEKLY_STOP_LOSS_REFILL_LIMIT:
+                            self._weekly_refill_blocked = True
+                            if self._pending_refill_recs is not None:
+                                logger.info(f"  [{trade_date}] 已取消未执行补仓，保留现金等待下周")
+                                self._clear_pending_refill()
+                            logger.info(f"  [{trade_date}] 本周累计止损达到"
+                                        f"{self.WEEKLY_STOP_LOSS_REFILL_LIMIT}笔，停止本周剩余补仓")
+
                     # 卖出释放了仓位，触发补仓选股
                     refill_budget = self._total_assets() * self._position_ratio(current_risk)
                     refill_mv = sum(p.market_value for p in self.positions.values())
                     refill_available = max(0.0, refill_budget - refill_mv)
-                    if refill_available >= 1000:
+                    if refill_available < 1000:
+                        continue
+                    if self._weekly_refill_blocked:
                         logger.info(f"  [{trade_date}] 仓位空缺 {refill_available:,.0f}元，"
-                                    f"触发补仓选股...")
-                        refill_recs, current_risk = self._run_weekly_selection(
-                            trade_date, current_risk)
-                        # 过滤掉已持有和刚卖出的股票
-                        refill_recs = [r for r in refill_recs
-                                       if r.get("code", "") not in self.positions
-                                       and r.get("code", "") not in exited]
-                        if refill_recs:
-                            self._pending_refill_recs = refill_recs
-                            self._pending_refill_budget = refill_available
-                            logger.info(f"  [{trade_date}] 补仓候选 {len(refill_recs)} 只，"
-                                        f"次日买入")
-                        else:
-                            logger.info(f"  [{trade_date}] 补仓选股无合适候选")
+                                    f"但已触发本周停补，保留现金")
+                        continue
+
+                    logger.info(f"  [{trade_date}] 仓位空缺 {refill_available:,.0f}元，"
+                                f"触发补仓选股...")
+                    refill_recs, current_risk = self._run_weekly_selection(
+                        trade_date, current_risk)
+                    refill_recs = [r for r in refill_recs
+                                   if r.get("code", "") not in self.positions
+                                   and r.get("code", "") not in exited]
+                    if refill_recs:
+                        cooldown_days = self.POST_STOP_LOSS_REFILL_COOLDOWN if stop_loss_exited else 0
+                        refill_reason = (
+                            f"止损后冷静期{self.POST_STOP_LOSS_REFILL_COOLDOWN}个交易日"
+                            if stop_loss_exited else "基于前日卖出后选股"
+                        )
+                        self._schedule_refill(
+                            refill_recs, refill_available, trade_date,
+                            cooldown_days, refill_reason)
+                    else:
+                        logger.info(f"  [{trade_date}] 补仓选股无合适候选")
 
             # 跨周补仓：如果本周最后一天卖出产生的补仓选股结果
             # 保留在 self._pending_refill_recs 中，下周初自动处理

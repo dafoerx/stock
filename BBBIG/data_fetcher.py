@@ -431,11 +431,12 @@ class StockDataFetcher:
                     if 'pre_close' not in df.columns or df['pre_close'].isna().all():
                         df['pre_close'] = df['close'].shift(1)
             else:
-                # 增量获取股票数据
-                self._ensure_daily_range(ts_code, start_date, end_date)
-
-                # 从缓存读取
+                # SQLite 已有足够窗口数据时直接使用，避免因 sync_log 缺口触发不必要的补数
                 df = db_cache.get_daily_by_code(ts_code, start_date, end_date)
+                min_cached_rows = max(days, 20)
+                if len(df) < min_cached_rows:
+                    self._ensure_daily_range(ts_code, start_date, end_date)
+                    df = db_cache.get_daily_by_code(ts_code, start_date, end_date)
 
                 if df.empty:
                     # 缓存没有，直接从 API 获取单只股票
