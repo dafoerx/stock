@@ -8,8 +8,10 @@ import sqlite3
 
 import pandas as pd
 
-# 默认数据库路径（相对于项目根目录）
-DEFAULT_DB = Path(__file__).parent.parent / "BBBIG" / "data" / "stock_data.db"
+from BBBIG.config import DB_FILE
+
+# 默认数据库路径（跟随项目配置解析）
+DEFAULT_DB = str(Path(DB_FILE))
 
 
 def _load_stock_from_conn(
@@ -65,7 +67,7 @@ def load_stock(
     ts_code   : str  Tushare 格式代码，如 '000001.SZ' 或 '600519.SH'
     start_date: str  起始日期 'YYYYMMDD'（含），默认全量
     end_date  : str  截止日期 'YYYYMMDD'（含），默认全量
-    db_path   : str  数据库路径，默认使用 BBBIG/data/stock_data.db
+    db_path   : str  数据库路径，默认使用项目配置解析出的 SQLite 缓存库
 
     Returns
     -------

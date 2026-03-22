@@ -287,11 +287,21 @@ class BBBIGSimulator:
         self._stop_loss_dates: dict[str, str] = {}
         self.COOLDOWN_DAYS = 10
 
+        # 行业止损冷静期：同行业止损后N个交易日内不再买入该行业
+        self._industry_stop_loss_dates: dict[str, str] = {}  # industry -> last stop_loss date
+        self.INDUSTRY_COOLDOWN_DAYS = 5  # 行业冷静期（比个股短一些）
+
         # 策略级风控：止损后暂停补仓，且单周连续止损达到阈值后停止当周补仓
-        self.POST_STOP_LOSS_REFILL_COOLDOWN = 1   # 跳过1个完整交易日后再允许补仓
+        self.POST_STOP_LOSS_REFILL_COOLDOWN = 3   # 跳过3个完整交易日后再允许补仓（加长：避免连续踩雷）
         self.WEEKLY_STOP_LOSS_REFILL_LIMIT = 2    # 单周累计止损达到2笔后停止当周补仓
         self._weekly_stop_loss_count = 0
         self._weekly_refill_blocked = False
+
+        # 全局熔断：连续N笔止损后，整体暂停建仓/补仓1周
+        self.GLOBAL_STOP_LOSS_STREAK_LIMIT = 3   # 连续止损达到3笔触发全局熔断
+        self._global_stop_loss_streak = 0         # 当前连续止损计数（盈利卖出重置）
+        self._global_circuit_breaker = False       # 全局熔断标志
+        self._circuit_breaker_weeks_left = 0       # 熔断剩余周数
 
         self.MAX_BUY_RANK = SIM_MAX_BUY_RANK
         self.stop_loss_mode = STOP_LOSS_MODE
@@ -433,7 +443,26 @@ class BBBIGSimulator:
             if pos.status.startswith("止损卖出"):
                 stop_loss_exited.append(code)
                 self._stop_loss_dates[code] = date_str
-                logger.info(f"  [{date_str}] {code} 进入止损冷静期（{self.COOLDOWN_DAYS}个交易日）")
+                # 记录行业止损冷静期
+                if pos.industry:
+                    self._industry_stop_loss_dates[pos.industry] = date_str
+                    logger.info(f"  [{date_str}] 行业[{pos.industry}]进入冷静期"
+                                f"（{self.INDUSTRY_COOLDOWN_DAYS}个交易日）")
+                # 全局连续止损计数
+                self._global_stop_loss_streak += 1
+                if self._global_stop_loss_streak >= self.GLOBAL_STOP_LOSS_STREAK_LIMIT:
+                    self._global_circuit_breaker = True
+                    self._circuit_breaker_weeks_left = 1
+                    logger.info(f"  [{date_str}] ⚠️ 全局熔断触发！连续止损"
+                                f"{self._global_stop_loss_streak}笔，暂停建仓1周")
+                logger.info(f"  [{date_str}] {code} 进入止损冷静期（{self.COOLDOWN_DAYS}个交易日）"
+                            f"| 全局连续止损 {self._global_stop_loss_streak} 笔")
+            else:
+                # 盈利卖出，重置全局连续止损计数
+                if self._global_stop_loss_streak > 0:
+                    logger.info(f"  [{date_str}] 盈利卖出，全局连续止损计数"
+                                f"从{self._global_stop_loss_streak}重置为0")
+                self._global_stop_loss_streak = 0
 
         return exited, stop_loss_exited
 
@@ -462,6 +491,17 @@ class BBBIGSimulator:
                 logger.info(f"  [{buy_date}] {code} {name} 止损冷静期中（已{days_since}天，需{self.COOLDOWN_DAYS}天），跳过")
                 return False, 0.0
 
+        # 行业止损冷静期检查
+        rec_industry = rec.get("industry", "")
+        if rec_industry and rec_industry in self._industry_stop_loss_dates:
+            ind_sl_date = self._industry_stop_loss_dates[rec_industry]
+            all_dates_after = _get_trade_dates_from_db(ind_sl_date, buy_date)
+            days_since = len(all_dates_after) - 1
+            if days_since < self.INDUSTRY_COOLDOWN_DAYS:
+                logger.info(f"  [{buy_date}] {code} {name} 行业[{rec_industry}]冷静期中"
+                            f"（已{days_since}天，需{self.INDUSTRY_COOLDOWN_DAYS}天），跳过")
+                return False, 0.0
+
         buy_low, buy_high = _parse_buy_range(rec.get("suggested_buy_range", ""))
         if buy_low <= 0 or buy_high <= 0:
             logger.debug(f"  {code} 买入区间无效，跳过")
@@ -484,6 +524,30 @@ class BBBIGSimulator:
             logger.info(f"  [{buy_date}] {code} {name} 价格 [{day_low:.2f},{day_high:.2f}] "
                         f"未落入买入区间 [{buy_low:.2f},{buy_high:.2f}]，跳过")
             return False, 0.0
+
+        # ---------- 趋势确认：收盘站上5日均线 + 当日非大阴线 ----------
+        day_open  = float(row["开盘"])
+        day_close = float(row["收盘"])
+        # 获取前10个自然日（覆盖5个交易日）的K线用于计算5日均线
+        try:
+            _ma_start_dt = datetime.strptime(buy_date, "%Y%m%d") - timedelta(days=12)
+            _ma_start = _ma_start_dt.strftime("%Y%m%d")
+            _hist = _get_kline_for_date_range(code, _ma_start, buy_date)
+            if _hist is not None and len(_hist) >= 5:
+                _recent5 = _hist.tail(5)
+                ma5 = float(_recent5["收盘"].mean())
+                # 条件1: 收盘价须 >= 5日均线的98%（留一点容差）
+                if day_close < ma5 * 0.98:
+                    logger.info(f"  [{buy_date}] {code} {name} 收盘{day_close:.2f} < "
+                                f"MA5*0.98={ma5*0.98:.2f}，趋势偏弱，跳过")
+                    return False, 0.0
+                # 条件2: 当日不能是大阴线（跌幅超过 -2%）
+                if day_open > 0 and (day_close - day_open) / day_open < -0.02:
+                    logger.info(f"  [{buy_date}] {code} {name} 当日大阴线"
+                                f"（{(day_close-day_open)/day_open*100:.1f}%），跳过")
+                    return False, 0.0
+        except Exception as _e:
+            logger.debug(f"  [{buy_date}] {code} 趋势确认异常: {_e}，继续买入")
 
         # 成交价：区间与当日K线的交集中点
         actual_low  = max(buy_low,  day_low)
@@ -658,16 +722,31 @@ class BBBIGSimulator:
             week_idx += 1
             self._weekly_stop_loss_count = 0
             self._weekly_refill_blocked = False
+
+            # 全局熔断检查：如果正在熔断中，递减剩余周数
+            if self._global_circuit_breaker:
+                if self._circuit_breaker_weeks_left > 0:
+                    self._circuit_breaker_weeks_left -= 1
+                if self._circuit_breaker_weeks_left <= 0:
+                    self._global_circuit_breaker = False
+                    self._global_stop_loss_streak = 0
+                    logger.info(f"  第{week_idx}周 全局熔断解除，恢复正常交易")
+
             logger.info(f"\n{'='*60}")
             logger.info(f"第 {week_idx} 周 | 选股日: {selection_date} | "
-                        f"周末: {week_dates[-1]}")
+                        f"周末: {week_dates[-1]}"
+                        f"{' | ⚠️ 全局熔断中（仅做止损检查）' if self._global_circuit_breaker else ''}")
             logger.info(f"{'='*60}")
             logger.info(f"  周内风控: 中风险仓位45% | 止损后补仓冷静期"
                         f"{self.POST_STOP_LOSS_REFILL_COOLDOWN}个交易日 | "
                         f"同周止损满{self.WEEKLY_STOP_LOSS_REFILL_LIMIT}笔停补")
 
-            # 1. 运行本周选股
-            recs, current_risk = self._run_weekly_selection(selection_date, current_risk)
+            # 1. 运行本周选股（全局熔断时跳过新建仓）
+            if self._global_circuit_breaker:
+                recs = []
+                logger.info(f"  全局熔断中，跳过本周选股和新建仓，仅做持仓止损/止盈检查")
+            else:
+                recs, current_risk = self._run_weekly_selection(selection_date, current_risk)
 
             # 2. 计算本周可用建仓资金 = 总资产 × 仓位比例 - 现有持仓市值
             total_budget = self._total_assets() * self._position_ratio(current_risk)
@@ -719,6 +798,10 @@ class BBBIGSimulator:
                     refill_mv = sum(p.market_value for p in self.positions.values())
                     refill_available = max(0.0, refill_budget - refill_mv)
                     if refill_available < 1000:
+                        continue
+                    if self._global_circuit_breaker:
+                        logger.info(f"  [{trade_date}] 仓位空缺 {refill_available:,.0f}元，"
+                                    f"但全局熔断中，保留现金")
                         continue
                     if self._weekly_refill_blocked:
                         logger.info(f"  [{trade_date}] 仓位空缺 {refill_available:,.0f}元，"

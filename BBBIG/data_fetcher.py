@@ -7,6 +7,7 @@
 import time
 import logging
 import os
+import random
 import threading
 import tushare as ts
 import pandas as pd
@@ -653,6 +654,84 @@ class StockDataFetcher:
         if stock_basic.empty:
             return {}
         return {ind: ind for ind in stock_basic['industry'].dropna().unique()}
+
+    # ========== 财务指标 ==========
+
+    def fetch_fina_indicator(self, ts_code: str, force: bool = False) -> pd.DataFrame:
+        """
+        获取个股核心财务指标（缓存优先，7天有效）
+        返回最近4个季度的: ROE, 扣非ROE, 毛利率, 净利润同比增速, 营收同比增速, 经营现金流/净利润, 流动比率
+        """
+        if not force and db_cache.is_fina_fresh(ts_code, max_age_hours=168):
+            return db_cache.get_fina_indicator(ts_code, limit=4)
+
+        try:
+            logger.debug(f"从 Tushare 获取 {ts_code} 财务指标...")
+            df = self._call_api(
+                self.pro.fina_indicator,
+                ts_code=ts_code,
+                fields='ts_code,ann_date,end_date,roe,roe_dt,grossprofit_margin,'
+                       'netprofit_yoy,revenue_yoy,ocf_to_profit,current_ratio',
+                limit=4
+            )
+            if df is not None and not df.empty:
+                db_cache.save_fina_indicator(df)
+                return df
+        except Exception as e:
+            logger.debug(f"获取 {ts_code} 财务指标异常: {e}")
+
+        # 回退到缓存（即使过期也用）
+        return db_cache.get_fina_indicator(ts_code, limit=4)
+
+    def fetch_fina_batch(self, ts_codes: list) -> dict:
+        """
+        批量获取多只股票的财务指标摘要
+        返回 {ts_code: {roe, revenue_yoy, netprofit_yoy, grossprofit_margin, ocf_to_profit, current_ratio}}
+
+        策略：先从缓存批量取，缺失的再逐只补充（限速）
+        """
+        fina_map = {}
+
+        # 1. 先尝试批量从缓存获取
+        cached = db_cache.get_fina_indicator_batch(ts_codes)
+        if not cached.empty:
+            for _, row in cached.iterrows():
+                code = row['ts_code']
+                fina_map[code] = {
+                    'roe': row.get('roe', None),
+                    'roe_dt': row.get('roe_dt', None),
+                    'grossprofit_margin': row.get('grossprofit_margin', None),
+                    'netprofit_yoy': row.get('netprofit_yoy', None),
+                    'revenue_yoy': row.get('revenue_yoy', None),
+                    'ocf_to_profit': row.get('ocf_to_profit', None),
+                    'current_ratio': row.get('current_ratio', None),
+                }
+
+        # 2. 缺失的逐只从API获取（限速，最多补50只）
+        missing = [c for c in ts_codes if c not in fina_map]
+        if missing:
+            logger.info(f"  财务指标缓存命中 {len(fina_map)} 只，需补充 {len(missing)} 只")
+            for i, code in enumerate(missing[:50]):
+                try:
+                    time.sleep(random.uniform(0.2, 0.5))
+                    df = self.fetch_fina_indicator(code)
+                    if not df.empty:
+                        latest = df.iloc[0]
+                        fina_map[code] = {
+                            'roe': latest.get('roe', None),
+                            'roe_dt': latest.get('roe_dt', None),
+                            'grossprofit_margin': latest.get('grossprofit_margin', None),
+                            'netprofit_yoy': latest.get('netprofit_yoy', None),
+                            'revenue_yoy': latest.get('revenue_yoy', None),
+                            'ocf_to_profit': latest.get('ocf_to_profit', None),
+                            'current_ratio': latest.get('current_ratio', None),
+                        }
+                except Exception as e:
+                    logger.debug(f"补充获取 {code} 财务数据失败: {e}")
+                if (i + 1) % 20 == 0:
+                    logger.info(f"  财务指标补充进度: {i+1}/{len(missing[:50])}")
+
+        return fina_map
 
     def _calc_sector_stats_by_industry(self, trade_date: str) -> pd.DataFrame:
         """通过行业分组计算板块统计（降级方案，使用缓存）"""

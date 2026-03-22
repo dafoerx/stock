@@ -143,6 +143,23 @@ class StockDBCache:
                     sell_lg_amount REAL,
                     PRIMARY KEY (trade_date, ts_code)
                 );
+
+                -- 财务指标（季度）
+                CREATE TABLE IF NOT EXISTS fina_indicator (
+                    ts_code TEXT,
+                    ann_date TEXT,
+                    end_date TEXT,
+                    roe REAL,
+                    roe_dt REAL,
+                    grossprofit_margin REAL,
+                    netprofit_yoy REAL,
+                    revenue_yoy REAL,
+                    ocf_to_profit REAL,
+                    current_ratio REAL,
+                    updated_at TEXT,
+                    PRIMARY KEY (ts_code, end_date)
+                );
+                CREATE INDEX IF NOT EXISTS idx_fina_ts ON fina_indicator(ts_code);
             """)
             conn.commit()
         finally:
@@ -607,10 +624,98 @@ class StockDBCache:
             stats = {}
             for table in ['trade_cal', 'stock_basic', 'daily', 'daily_basic',
                          'index_daily', 'moneyflow_ind', 'moneyflow',
-                         'concept', 'concept_detail', 'sync_log']:
-                row = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
-                stats[table] = row[0]
+                         'concept', 'concept_detail', 'sync_log',
+                         'fina_indicator']:
+                try:
+                    row = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+                    stats[table] = row[0]
+                except Exception:
+                    stats[table] = 0
             return stats
+        finally:
+            conn.close()
+
+    # ========== 财务指标 ==========
+
+    def get_fina_indicator(self, ts_code: str, limit: int = 4) -> pd.DataFrame:
+        """获取某只股票最近N个季度的财务指标"""
+        conn = self._get_conn()
+        try:
+            df = pd.read_sql(
+                "SELECT * FROM fina_indicator WHERE ts_code=? ORDER BY end_date DESC LIMIT ?",
+                conn, params=(ts_code, limit)
+            )
+            return df
+        finally:
+            conn.close()
+
+    def get_fina_indicator_batch(self, ts_codes: list) -> pd.DataFrame:
+        """批量获取多只股票最新一期财务指标"""
+        if not ts_codes:
+            return pd.DataFrame()
+        conn = self._get_conn()
+        try:
+            placeholders = ','.join(['?'] * len(ts_codes))
+            df = pd.read_sql(
+                f"""SELECT f.* FROM fina_indicator f
+                    INNER JOIN (
+                        SELECT ts_code, MAX(end_date) as max_date
+                        FROM fina_indicator
+                        WHERE ts_code IN ({placeholders})
+                        GROUP BY ts_code
+                    ) latest ON f.ts_code = latest.ts_code AND f.end_date = latest.max_date""",
+                conn, params=ts_codes
+            )
+            return df
+        finally:
+            conn.close()
+
+    def save_fina_indicator(self, df: pd.DataFrame):
+        """保存财务指标数据"""
+        if df is None or df.empty:
+            return
+        conn = self._get_conn()
+        try:
+            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            cols = ['ts_code', 'ann_date', 'end_date', 'roe', 'roe_dt',
+                    'grossprofit_margin', 'netprofit_yoy', 'revenue_yoy',
+                    'ocf_to_profit', 'current_ratio']
+            for _, row in df.iterrows():
+                values = tuple(row.get(c, None) for c in cols) + (now,)
+                conn.execute(
+                    f"INSERT OR REPLACE INTO fina_indicator ({','.join(cols)}, updated_at) "
+                    f"VALUES ({','.join(['?'] * (len(cols) + 1))})",
+                    values
+                )
+            conn.commit()
+            logger.info(f"缓存财务指标 {len(df)} 条")
+        finally:
+            conn.close()
+
+    def has_fina_indicator(self, ts_code: str) -> bool:
+        """检查某只股票是否有财务指标缓存"""
+        conn = self._get_conn()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM fina_indicator WHERE ts_code=?", (ts_code,)
+            ).fetchone()
+            return row[0] > 0
+        finally:
+            conn.close()
+
+    def is_fina_fresh(self, ts_code: str, max_age_hours: int = 168) -> bool:
+        """检查财务指标是否需要更新（默认7天有效期）"""
+        conn = self._get_conn()
+        try:
+            row = conn.execute(
+                "SELECT MAX(updated_at) FROM fina_indicator WHERE ts_code=?", (ts_code,)
+            ).fetchone()
+            if not row or not row[0]:
+                return False
+            last_update = datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S')
+            return (datetime.now() - last_update).total_seconds() < max_age_hours * 3600
+        except Exception:
+            return False
         finally:
             conn.close()
 

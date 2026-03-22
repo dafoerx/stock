@@ -21,8 +21,9 @@ BBBIG/.env
 *.env
 
 # 本地数据库和缓存（体积大，不提交）
-BBBIG/data/stock_data.db
+*.db
 BBBIG/data/*.db
+market_data_cache/
 
 # 选股结果（本地输出，不提交）
 BBBIG/data/results/

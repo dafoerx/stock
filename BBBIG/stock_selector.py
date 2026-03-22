@@ -17,7 +17,7 @@ from BBBIG.deepseek_client import deepseek
 from BBBIG.config import (
     TOP_N, KLINE_DAYS, MIN_MARKET_CAP, MIN_VOLUME,
     FACTOR_WEIGHTS, MAX_SAME_INDUSTRY, MARKET_RISK_THRESHOLD,
-    AI_TEMPERATURE, AI_MAX_TOKENS
+    AI_TEMPERATURE, AI_MAX_TOKENS, STRATIFIED_SAMPLING
 )
 
 logger = logging.getLogger("BBBIG")
@@ -208,9 +208,10 @@ def calc_technical_indicators(kline_df: pd.DataFrame) -> dict:
 
 # ========== 多因子评分 ==========
 
-def _multifactor_score(row: pd.Series, indicators: dict, hot_industries: set) -> float:
+def _multifactor_score(row: pd.Series, indicators: dict, hot_industries: set,
+                      fina_data: dict = None) -> float:
     """
-    多因子综合评分
+    多因子综合评分（含财务基本面）
     返回评分越高越好
     """
     weights = FACTOR_WEIGHTS
@@ -357,6 +358,65 @@ def _multifactor_score(row: pd.Series, indicators: dict, hot_industries: set) ->
     elif kdj_signal == '超买':
         score -= 3
 
+    # 9. 基本面因子（ROE/营收增速/现金流质量）
+    fina_score = 0
+    if fina_data:
+        # ROE（加权核心指标）
+        roe = fina_data.get('roe')
+        if roe is not None:
+            if roe >= 15:
+                fina_score += 8    # 优质ROE
+            elif roe >= 10:
+                fina_score += 5    # 良好ROE
+            elif roe >= 5:
+                fina_score += 2    # 一般ROE
+            elif roe < 0:
+                fina_score -= 5    # 亏损企业
+
+        # 营收同比增速
+        rev_yoy = fina_data.get('revenue_yoy')
+        if rev_yoy is not None:
+            if rev_yoy >= 30:
+                fina_score += 5    # 高速增长
+            elif rev_yoy >= 15:
+                fina_score += 3    # 稳健增长
+            elif rev_yoy >= 0:
+                fina_score += 1    # 微增
+            elif rev_yoy < -10:
+                fina_score -= 3    # 营收大幅下滑
+
+        # 净利润同比增速
+        np_yoy = fina_data.get('netprofit_yoy')
+        if np_yoy is not None:
+            if np_yoy >= 30:
+                fina_score += 4    # 利润高增
+            elif np_yoy >= 10:
+                fina_score += 2
+            elif np_yoy < -20:
+                fina_score -= 4    # 利润大幅下降
+
+        # 经营现金流/净利润 (现金流质量)
+        ocf_ratio = fina_data.get('ocf_to_profit')
+        if ocf_ratio is not None:
+            if ocf_ratio >= 80:
+                fina_score += 3    # 现金流健康
+            elif ocf_ratio >= 50:
+                fina_score += 1
+            elif ocf_ratio < 0:
+                fina_score -= 3    # 经营性现金流为负，利润质量差
+
+        # 毛利率
+        gpm = fina_data.get('grossprofit_margin')
+        if gpm is not None:
+            if gpm >= 40:
+                fina_score += 2    # 高毛利，有定价权
+            elif gpm >= 20:
+                fina_score += 1
+            elif gpm < 10:
+                fina_score -= 1    # 低毛利，竞争激烈
+
+    score += fina_score * weights.get("fundamental", 2.0)
+
     return round(score, 2)
 
 
@@ -492,9 +552,10 @@ def _format_kline_summary_enhanced(kline_df: pd.DataFrame, indicators: dict) -> 
 # ========== 预筛选（多因子版） ==========
 
 def _prefilter_candidates(all_stocks: pd.DataFrame, kline_map: dict,
-                          hot_industries: set, top_n: int = 80) -> pd.DataFrame:
+                          hot_industries: set, top_n: int = 80,
+                          fina_map: dict = None) -> pd.DataFrame:
     """
-    多因子预筛选：基础面过滤 + 技术指标评分
+    多因子预筛选：基础面过滤 + 技术指标评分 + 财务基本面
     """
     df = all_stocks.copy()
 
@@ -509,6 +570,8 @@ def _prefilter_candidates(all_stocks: pd.DataFrame, kline_map: dict,
         return df
 
     df = df.copy()
+    if fina_map is None:
+        fina_map = {}
 
     # 为每只股票计算多因子评分
     scores = []
@@ -521,7 +584,12 @@ def _prefilter_candidates(all_stocks: pd.DataFrame, kline_map: dict,
         else:
             ind = {}
         indicators_map[code] = ind
-        score = _multifactor_score(row, ind, hot_industries)
+
+        # 获取该股票的财务数据
+        ts_code = f"{code}.SH" if code.startswith('6') else f"{code}.SZ"
+        fina_data = fina_map.get(ts_code, {})
+
+        score = _multifactor_score(row, ind, hot_industries, fina_data)
         scores.append(score)
 
     df["factor_score"] = scores
@@ -713,20 +781,56 @@ def run_stock_selection(selection_date: str = None) -> dict:
     rough_df = rough_df[(rough_df["市盈率动"] > 0) & (rough_df["市盈率动"] < 200)]
     rough_df = rough_df[rough_df["市净率"] > 0]
 
-    # 问题1修复：70%成交额排名靠前 + 30%随机抽样，避免永远只看大市值活跃股
-    top_140 = rough_df.sort_values("成交额", ascending=False).head(140)
-    remaining = rough_df[~rough_df["代码"].isin(top_140["代码"])]
-    random_60 = remaining.sample(n=min(60, len(remaining)), random_state=None) if len(remaining) > 0 else pd.DataFrame()
-    rough_df = pd.concat([top_140, random_60], ignore_index=True)
-    rough_df = rough_df.drop_duplicates(subset=["代码"]).head(200)
+    # 市值分层抽样：确保大中小盘均有代表，避免永远只看大市值活跃股
+    sampled_parts = []
+    sampling_log = []
+    for cap_name, cap_cfg in STRATIFIED_SAMPLING.items():
+        min_mv = cap_cfg.get("min_mv", 0)
+        max_mv = cap_cfg.get("max_mv", float('inf'))
+        target_count = cap_cfg.get("count", 50)
+
+        layer = rough_df[(rough_df["总市值"] >= min_mv) & (rough_df["总市值"] < max_mv)]
+        if layer.empty:
+            sampling_log.append(f"{cap_name}:0")
+            continue
+
+        # 每层内按成交额排序取前60%，剩余随机抽样40%，增加多样性
+        top_n_layer = max(1, int(target_count * 0.6))
+        rand_n_layer = target_count - top_n_layer
+
+        top_part = layer.sort_values("成交额", ascending=False).head(top_n_layer)
+        remaining_layer = layer[~layer["代码"].isin(top_part["代码"])]
+        rand_part = remaining_layer.sample(
+            n=min(rand_n_layer, len(remaining_layer)), random_state=None
+        ) if len(remaining_layer) > 0 else pd.DataFrame()
+
+        sampled_parts.append(top_part)
+        if not rand_part.empty:
+            sampled_parts.append(rand_part)
+        actual = len(top_part) + len(rand_part)
+        sampling_log.append(f"{cap_name}:{actual}")
+
+    if sampled_parts:
+        rough_df = pd.concat(sampled_parts, ignore_index=True)
+        rough_df = rough_df.drop_duplicates(subset=["代码"])
     rough_codes = rough_df["代码"].tolist()
-    logger.info(f"  粗筛: 成交额TOP140 + 随机{len(random_60)}只 = {len(rough_codes)}只候选")
+    logger.info(f"  分层抽样: {' / '.join(sampling_log)} = 共{len(rough_codes)}只候选")
 
     kline_map = _fetch_kline_batch(rough_codes, days=KLINE_DAYS, end_date_str=analysis_date)
     logger.info(f"  成功获取 {len(kline_map)} 只股票K线")
 
-    # 多因子预筛选
-    prefilter_result = _prefilter_candidates(all_stocks, kline_map, hot_industries, top_n=80)
+    # 获取候选股票的财务指标（ROE/营收增速/现金流等）
+    logger.info("  获取候选股财务指标...")
+    ts_codes_for_fina = [
+        f"{c}.SH" if c.startswith('6') else f"{c}.SZ"
+        for c in rough_codes
+    ]
+    fina_map = fetcher.fetch_fina_batch(ts_codes_for_fina)
+    logger.info(f"  获取 {len(fina_map)} 只股票财务指标")
+
+    # 多因子预筛选（含财务基本面）
+    prefilter_result = _prefilter_candidates(all_stocks, kline_map, hot_industries,
+                                              top_n=80, fina_map=fina_map)
     if isinstance(prefilter_result, tuple):
         candidates, indicators_map = prefilter_result
     else:
@@ -757,7 +861,7 @@ def run_stock_selection(selection_date: str = None) -> dict:
     elif market_risk["risk_level"] == "中":
         risk_note = f"\n⚠ 当前市场风险中等（大盘近5日涨跌{market_risk['index_chg_5d']:+.1f}%），请适当控制仓位。"
 
-    # 构造候选股数据摘要（含技术指标 + 多因子评分明细）
+    # 构造候选股数据摘要（含技术指标 + 多因子评分 + 财务指标）
     stock_summaries = []
     for _, row in candidates.head(50).iterrows():
         code = row["代码"]
@@ -767,9 +871,8 @@ def run_stock_selection(selection_date: str = None) -> dict:
             ind = calc_technical_indicators(kline)
         kline_text = _format_kline_summary_enhanced(kline, ind)
 
-        # 问题3修复：将多因子各维度得分展开，让AI有据可依
+        # 量化各子项得分展开
         factor_score = row.get('factor_score', 0)
-        # 重新计算各子项得分，供AI参考
         trend_s = 0
         if ind.get('ma_bull'): trend_s += 10
         elif ind.get('ma_bear'): trend_s -= 5
@@ -783,6 +886,25 @@ def run_stock_selection(selection_date: str = None) -> dict:
         if ind.get('vol_price_corr', 0) > 0.3: vol_s += 3
         hot_s = 8 if row.get('所处行业', '') in hot_industries else 0
 
+        # 财务指标摘要
+        ts_code = f"{code}.SH" if code.startswith('6') else f"{code}.SZ"
+        fina = fina_map.get(ts_code, {})
+        fina_text = ""
+        if fina:
+            parts = []
+            if fina.get('roe') is not None:
+                parts.append(f"ROE:{fina['roe']:.1f}%")
+            if fina.get('revenue_yoy') is not None:
+                parts.append(f"营收增速:{fina['revenue_yoy']:.1f}%")
+            if fina.get('netprofit_yoy') is not None:
+                parts.append(f"净利增速:{fina['netprofit_yoy']:.1f}%")
+            if fina.get('grossprofit_margin') is not None:
+                parts.append(f"毛利率:{fina['grossprofit_margin']:.1f}%")
+            if fina.get('ocf_to_profit') is not None:
+                parts.append(f"经营现金流/净利润:{fina['ocf_to_profit']:.0f}%")
+            if parts:
+                fina_text = f"\n  [财务指标] {' '.join(parts)}"
+
         stock_summaries.append(
             f"【{code} {row['名称']}】 行业:{row['所处行业']} "
             f"最新价:{row['最新价']:.2f} 涨跌幅:{row['涨跌幅']:.2f}% "
@@ -790,79 +912,76 @@ def run_stock_selection(selection_date: str = None) -> dict:
             f"市盈率:{row['市盈率动']:.1f} 市净率:{row['市净率']:.2f} "
             f"总市值:{row['总市值']/1e8:.0f}亿 量比:{row['量比']:.2f}\n"
             f"  [量化预评分] 总分:{factor_score:.1f} "
-            f"(趋势子项:{trend_s} 量能子项:{vol_s} 板块热度子项:{hot_s} "
-            f"近5日涨幅:{ind.get('chg_5d',0):.1f}% 距20日高点:{ind.get('dist_high_20d',0):.1f}%)\n"
+            f"(趋势:{trend_s} 量能:{vol_s} 板块热度:{hot_s} "
+            f"近5日涨幅:{ind.get('chg_5d',0):.1f}% 距20日高点:{ind.get('dist_high_20d',0):.1f}%)"
+            f"{fina_text}\n"
             f"  K线及技术指标:\n  {kline_text}"
         )
 
-    system_prompt = """你是一位资深的A股量化分析师和投资顾问。请基于提供的市场数据进行专业分析。
+    # ===== AI角色重定义：专注信息增量，不重复量化已覆盖的评分 =====
+    system_prompt = """你是一位资深A股投资研究总监，擅长产业链分析、K线形态识别和风险排雷。
 
-候选股票已经过量化多因子预评分（综合了趋势、量能、动量、估值、板块热度、追高惩罚8个维度），
-请在你的评分中**重点参考"量化预评分"字段**，并结合你对K线形态和市场背景的理解进行最终裁决。
-量化预评分高的股票不一定都要选，但如果你给某只量化预评分低的股票高分，请在理由中说明原因。
+**重要：候选股票已经过量化系统的9因子预评分（趋势、动量、量能、换手率、估值、板块热度、追高惩罚、KDJ/RSI辅助、基本面财务指标），这些维度已由量化模型充分覆盖。**
 
-你必须严格按照以下评分框架对每只候选股票进行打分（满分100分）：
+你的独特价值在于**量化模型无法覆盖的信息增量**，请专注于以下4个AI专属维度：
 
-## 评分维度（共5项，每项20分）：
+## AI专属评分维度（共4项，满分100分）：
 
-### 1. 趋势评分（20分）[参考量化预评分中的趋势子项]
-- 均线多头排列（MA5>MA10>MA20）: +15分
-- MACD金叉或多头: +5分
-- 均线空头排列: -10分
-- MACD死叉: -5分
+### 1. 产业逻辑与竞争格局评分（30分）
+- 该公司在产业链中的位置（上游/中游/下游）及议价能力: 0~10分
+- 行业景气度方向（行业处于上升/成熟/衰退周期的哪个阶段）: 0~10分
+- 公司竞争壁垒（品牌/技术/规模/牌照/客户粘性）: 0~10分
+- 亏损或护城河薄弱: -5~-10分
 
-### 2. 量能评分（20分）[参考量化预评分中的量能子项]
-- 近3日温和放量（1.2~2.5倍）且量价正相关: +15分
-- 极端放量（>3倍）: +5分（可能冲顶）
-- 缩量: +8分（如在上涨趋势中可能是洗盘）
-- 量价背离（涨时缩量或跌时放量）: -5分
+### 2. K线形态与技术形态识别（25分）——量化难以捕捉的视觉模式
+- 经典底部形态（W底/头肩底/圆弧底/箱体突破）: +15~20分
+- 中继整理形态（旗形/三角形/楔形收敛）: +10~15分
+- 危险顶部形态（头肩顶/M顶/岛形反转）: -10~-15分
+- 无明显形态特征: 0~5分
 
-### 3. 基本面评分（20分）
-- PE 10~30 且 PB < 3: +15分
-- PE 30~50: +10分
-- PE > 80 或 PB > 8: -5分
-- 行业龙头/市值>500亿: +5分
+### 3. 风险排雷评分（25分）——扣分制，满分25分起步
+- 从25分起扣：
+- 近期有股东大量减持/质押: -8分
+- PE/PB与行业均值严重偏离: -5分
+- 营收增速与净利增速方向背离（增收不增利或相反）: -5分
+- 换手率异常（突然放大3倍以上）: -3分
+- 刚经历大涨（近10日涨幅>15%），回调风险大: -5分
+- 行业正处于政策利空期: -5分
+- 无明显风险: 保持25分
 
-### 4. 技术形态评分（20分）
-- RSI 30~60（强势但不超买）: +10分
-- KDJ 超卖区金叉: +10分
-- 布林带下轨附近（<0.3）: +8分
-- RSI > 75 或 KDJ超买: -10分
+### 4. 板块轮动与市场情绪判断（20分）
+- 该板块处于轮动启动初期（资金刚开始流入）: +15~20分
+- 板块处于主升浪中期: +10~15分
+- 板块已高位滞涨（资金开始分歧）: 0~5分
+- 板块处于退潮期: -5分
 
-### 5. 板块热度评分（20分）[参考量化预评分中的板块热度子项和行业资金流数据]
-- 所属行业为当日主力净流入TOP5: +15分
-- 所属行业主力净流入为正: +10分
-- 所属行业主力净流出: -5分
+## 关键原则：
+1. **不要重复量化模型已做的工作**（趋势/动量/估值/量能等维度不要再打分）
+2. 量化预评分仅作为参考背景，你的评分是独立的AI增量视角
+3. 量化高分+AI高分 = 强烈推荐；量化高分+AI低分 = 可能有隐藏风险；量化低分+AI高分 = 可能被量化低估
+4. 推荐理由必须体现你的独特判断（产业逻辑/形态识别/风险发现），不要复述量化指标数值"""
 
-## 输出要求：
-- 选出总评分最高的股票
-- 同一行业最多选3只
-- 必须给出每只股票的总评分和各维度得分
-- 量化预评分低但你认为值得入选的，在reason中说明理由
-- 高风险市场环境下优先选择低波动、高分红防御标的"""
-
-    user_prompt = f"""请分析以下A股市场数据，从候选股票中选出最值得投资的前{effective_top_n}支股票。
+    user_prompt = f"""请从以下经量化预筛选的A股候选股中，用你的AI专属视角选出最值得投资的前{effective_top_n}只。
 {risk_note}
 当前日期: {analysis_date_display}
 
 {result['hot_sectors']}
 
-以下是经过多因子预筛选的候选股票（含完整技术指标）：
+以下是量化9因子预筛选后的候选股票（量化已覆盖趋势/动量/量能/估值/板块/基本面等维度）：
 
 {''.join(stock_summaries[:40])}
 
-请完成以下分析任务：
-1. **市场热点分析**：基于板块资金流向+大盘环境，分析当前A股市场热点和趋势方向
-2. **逐股评分**：按上述5维度评分框架对候选股打分
-3. **选股推荐**：选出总评分最高的前{effective_top_n}支（同行业不超过{MAX_SAME_INDUSTRY}只）
-4. **关键风险点**：每只股票指出1个最大风险因素
-5. **潜在催化剂**：每只股票指出可能的上涨催化因素
+请完成以下任务：
+1. **市场热点与板块轮动判断**：哪些板块处于轮动启动期/主升期/退潮期？
+2. **AI增量评分**：按上述4个AI专属维度逐股评分（产业逻辑30分 + 形态识别25分 + 风险排雷25分 + 板块轮动20分）
+3. **选出TOP{effective_top_n}**：综合量化预评分和你的AI评分，选出最优标的（同行业不超过{MAX_SAME_INDUSTRY}只）
+4. **每只股票给出**：推荐理由（侧重你的独特发现）、最大风险、潜在催化剂
 
 请严格按以下JSON格式返回：
 ```json
 {{
-  "market_analysis": "对当前A股市场热点和趋势的分析（200字以内）",
-  "market_risk_assessment": "对当前市场风险的评估（100字以内）",
+  "market_analysis": "对当前板块轮动节奏和市场情绪的判断（200字以内）",
+  "market_risk_assessment": "对当前市场系统性风险的评估（100字以内）",
   "recommendations": [
     {{
       "rank": 1,
@@ -871,14 +990,13 @@ def run_stock_selection(selection_date: str = None) -> dict:
       "industry": "所属行业",
       "current_price": 当前价格,
       "scores": {{
-        "trend": 0,
-        "volume": 0,
-        "fundamental": 0,
-        "technical": 0,
-        "sector_heat": 0,
+        "industry_logic": 0,
+        "pattern_recognition": 0,
+        "risk_screening": 0,
+        "sector_rotation": 0,
         "total": 0
       }},
-      "reason": "推荐理由（含K线分析、量能分析、基本面分析，150字以内）",
+      "reason": "推荐理由——侧重产业逻辑/K线形态/风险发现等AI独特视角（150字以内）",
       "risk_factor": "最大风险因素（50字以内）",
       "catalyst": "潜在催化剂（50字以内）",
       "suggested_buy_range": "建议买入区间（如 12.5-13.0）",
@@ -1004,9 +1122,17 @@ def format_selection_report(result: dict) -> str:
             # 评分明细
             scores = rec.get("scores", {})
             if scores:
-                lines.append(f"  评分: 趋势{scores.get('trend',0)} 量能{scores.get('volume',0)} "
-                             f"基本面{scores.get('fundamental',0)} 技术{scores.get('technical',0)} "
-                             f"板块{scores.get('sector_heat',0)} → 总分{scores.get('total',0)}")
+                # 兼容新旧评分维度
+                if 'industry_logic' in scores:
+                    lines.append(f"  AI评分: 产业逻辑{scores.get('industry_logic',0)} "
+                                 f"形态识别{scores.get('pattern_recognition',0)} "
+                                 f"风险排雷{scores.get('risk_screening',0)} "
+                                 f"板块轮动{scores.get('sector_rotation',0)} "
+                                 f"→ 总分{scores.get('total',0)}")
+                else:
+                    lines.append(f"  评分: 趋势{scores.get('trend',0)} 量能{scores.get('volume',0)} "
+                                 f"基本面{scores.get('fundamental',0)} 技术{scores.get('technical',0)} "
+                                 f"板块{scores.get('sector_heat',0)} → 总分{scores.get('total',0)}")
 
             lines.append(f"  推荐理由: {rec.get('reason', '-')}")
             lines.append(f"  风险因素: {rec.get('risk_factor', '-')}")
