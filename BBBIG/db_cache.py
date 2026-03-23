@@ -160,6 +160,33 @@ class StockDBCache:
                     PRIMARY KEY (ts_code, end_date)
                 );
                 CREATE INDEX IF NOT EXISTS idx_fina_ts ON fina_indicator(ts_code);
+
+                -- 新闻数据缓存
+                CREATE TABLE IF NOT EXISTS news_cache (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trade_date TEXT,
+                    src TEXT,
+                    title TEXT,
+                    content TEXT,
+                    ts_code TEXT,
+                    name TEXT,
+                    fetched_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_news_date ON news_cache(trade_date);
+                CREATE INDEX IF NOT EXISTS idx_news_code ON news_cache(ts_code);
+
+                -- 情绪分析结果缓存
+                CREATE TABLE IF NOT EXISTS sentiment_cache (
+                    target_type TEXT,
+                    target_name TEXT,
+                    trade_date TEXT,
+                    score REAL,
+                    label TEXT,
+                    reason TEXT,
+                    analyzed_at TEXT,
+                    PRIMARY KEY (target_type, target_name, trade_date)
+                );
+                CREATE INDEX IF NOT EXISTS idx_sentiment_date ON sentiment_cache(trade_date);
             """)
             conn.commit()
         finally:
@@ -716,6 +743,152 @@ class StockDBCache:
             return (datetime.now() - last_update).total_seconds() < max_age_hours * 3600
         except Exception:
             return False
+        finally:
+            conn.close()
+
+    # ========== 新闻缓存 ==========
+
+    def save_news(self, news_list: list, trade_date: str):
+        """保存新闻数据"""
+        if not news_list:
+            return
+        conn = self._get_conn()
+        try:
+            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            for news in news_list:
+                conn.execute(
+                    """INSERT INTO news_cache
+                    (trade_date, src, title, content, ts_code, name, fetched_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (trade_date,
+                     news.get('src', ''),
+                     news.get('title', ''),
+                     news.get('content', '')[:500],  # 截断过长内容
+                     news.get('ts_code', ''),
+                     news.get('name', ''),
+                     now)
+                )
+            conn.commit()
+            logger.info(f"缓存 {trade_date} 新闻 {len(news_list)} 条")
+        finally:
+            conn.close()
+
+    def get_news(self, trade_date: str, ts_code: str = None) -> list:
+        """获取某日新闻（可按股票代码过滤）"""
+        conn = self._get_conn()
+        try:
+            if ts_code:
+                rows = conn.execute(
+                    "SELECT title, content, ts_code, name, src FROM news_cache "
+                    "WHERE trade_date=? AND ts_code=?",
+                    (trade_date, ts_code)
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT title, content, ts_code, name, src FROM news_cache "
+                    "WHERE trade_date=?",
+                    (trade_date,)
+                ).fetchall()
+            return [
+                {"title": r[0], "content": r[1], "ts_code": r[2], "name": r[3], "src": r[4]}
+                for r in rows
+            ]
+        finally:
+            conn.close()
+
+    def has_news(self, trade_date: str) -> bool:
+        """检查某日新闻是否已缓存"""
+        conn = self._get_conn()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM news_cache WHERE trade_date=?", (trade_date,)
+            ).fetchone()
+            return row[0] > 0
+        finally:
+            conn.close()
+
+    def get_news_multi_dates(self, start_date: str, end_date: str) -> list:
+        """获取多日新闻"""
+        conn = self._get_conn()
+        try:
+            rows = conn.execute(
+                "SELECT title, content, ts_code, name, src FROM news_cache "
+                "WHERE trade_date BETWEEN ? AND ? ORDER BY trade_date DESC",
+                (start_date, end_date)
+            ).fetchall()
+            return [
+                {"title": r[0], "content": r[1], "ts_code": r[2], "name": r[3], "src": r[4]}
+                for r in rows
+            ]
+        finally:
+            conn.close()
+
+    # ========== 情绪分析缓存 ==========
+
+    def save_sentiment(self, target_type: str, target_name: str,
+                       trade_date: str, score: float, label: str, reason: str):
+        """保存情绪分析结果"""
+        conn = self._get_conn()
+        try:
+            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            conn.execute(
+                """INSERT OR REPLACE INTO sentiment_cache
+                (target_type, target_name, trade_date, score, label, reason, analyzed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (target_type, target_name, trade_date, score, label, reason, now)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def save_sentiment_batch(self, target_type: str, trade_date: str,
+                             sentiments: dict):
+        """批量保存情绪分析结果"""
+        if not sentiments:
+            return
+        conn = self._get_conn()
+        try:
+            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            for name, data in sentiments.items():
+                conn.execute(
+                    """INSERT OR REPLACE INTO sentiment_cache
+                    (target_type, target_name, trade_date, score, label, reason, analyzed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (target_type, name, trade_date,
+                     data.get('score', 0), data.get('label', '中性'),
+                     data.get('reason', ''), now)
+                )
+            conn.commit()
+            logger.info(f"缓存 {trade_date} {target_type}情绪 {len(sentiments)} 条")
+        finally:
+            conn.close()
+
+    def get_sentiment(self, target_type: str, trade_date: str) -> dict:
+        """获取某日某类型的情绪分析结果"""
+        conn = self._get_conn()
+        try:
+            rows = conn.execute(
+                "SELECT target_name, score, label, reason FROM sentiment_cache "
+                "WHERE target_type=? AND trade_date=?",
+                (target_type, trade_date)
+            ).fetchall()
+            return {
+                r[0]: {"score": r[1], "label": r[2], "reason": r[3]}
+                for r in rows
+            }
+        finally:
+            conn.close()
+
+    def has_sentiment(self, target_type: str, trade_date: str) -> bool:
+        """检查某日情绪分析是否已缓存"""
+        conn = self._get_conn()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM sentiment_cache "
+                "WHERE target_type=? AND trade_date=?",
+                (target_type, trade_date)
+            ).fetchone()
+            return row[0] > 0
         finally:
             conn.close()
 

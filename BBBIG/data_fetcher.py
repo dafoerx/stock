@@ -647,6 +647,149 @@ class StockDataFetcher:
             logger.error(f"获取概念板块资金流异常: {e}")
             return pd.DataFrame()
 
+    # ========== 新闻数据（情绪分析用） ==========
+
+    def fetch_news(self, trade_date: str = None, days: int = 3) -> list:
+        """
+        获取近N日市场新闻 + 个股公告（用于情绪分析）
+
+        策略：
+        1. 优先从 SQLite 缓存读取
+        2. 缺失日期从 Tushare news 接口补充
+        3. 返回统一格式的新闻列表
+
+        返回: [{"title": str, "content": str, "ts_code": str, "name": str, "src": str}]
+        """
+        trade_date = self._resolve_trade_date(trade_date)
+        if not trade_date:
+            return []
+
+        self._ensure_trade_cal()
+        end_dt = datetime.strptime(trade_date, '%Y%m%d')
+        start_dt = end_dt - timedelta(days=days + 2)  # 多取几天确保覆盖交易日
+        start_date = start_dt.strftime('%Y%m%d')
+
+        # 获取这个日期范围内的交易日
+        trade_dates = db_cache.get_trade_dates(start_date, trade_date)
+        if not trade_dates:
+            trade_dates = [trade_date]
+        # 只取最近 days 个交易日
+        trade_dates = trade_dates[-days:]
+
+        all_news = []
+
+        for td in trade_dates:
+            # 检查缓存
+            if db_cache.has_news(td):
+                cached = db_cache.get_news(td)
+                all_news.extend(cached)
+                continue
+
+            # 从 Tushare 获取
+            date_news = []
+
+            # 方案1: 新闻快讯（news 接口）
+            try:
+                df = self._call_api(
+                    self.pro.news,
+                    src='sina',
+                    start_date=f"{td[:4]}-{td[4:6]}-{td[6:8]} 00:00:00",
+                    end_date=f"{td[:4]}-{td[4:6]}-{td[6:8]} 23:59:59",
+                    fields='datetime,title,content,channels'
+                )
+                if df is not None and not df.empty:
+                    for _, row in df.iterrows():
+                        title = str(row.get('title', '')).strip()
+                        if title and len(title) > 5:
+                            date_news.append({
+                                "title": title,
+                                "content": str(row.get('content', ''))[:300],
+                                "ts_code": "",
+                                "name": "",
+                                "src": "news"
+                            })
+                    logger.info(f"  获取 {td} 新闻快讯 {len(date_news)} 条")
+            except Exception as e:
+                logger.debug(f"获取 {td} 新闻快讯异常: {e}")
+
+            # 方案2: 上市公司公告 (major_news 接口作为补充)
+            try:
+                df2 = self._call_api(
+                    self.pro.major_news,
+                    src='',
+                    start_date=f"{td[:4]}-{td[4:6]}-{td[6:8]} 00:00:00",
+                    end_date=f"{td[:4]}-{td[4:6]}-{td[6:8]} 23:59:59",
+                    fields='title,content,pub_time,src'
+                )
+                if df2 is not None and not df2.empty:
+                    for _, row in df2.iterrows():
+                        title = str(row.get('title', '')).strip()
+                        if title and len(title) > 5:
+                            date_news.append({
+                                "title": title,
+                                "content": str(row.get('content', ''))[:300],
+                                "ts_code": "",
+                                "name": "",
+                                "src": "major_news"
+                            })
+                    logger.info(f"  获取 {td} 重大新闻 {len(df2)} 条")
+            except Exception as e:
+                logger.debug(f"获取 {td} 重大新闻异常（接口可能不可用）: {e}")
+
+            # 写入缓存
+            if date_news:
+                db_cache.save_news(date_news, td)
+                all_news.extend(date_news)
+
+        logger.info(f"共获取 {len(all_news)} 条新闻（{len(trade_dates)} 个交易日）")
+        return all_news
+
+    def fetch_stock_news(self, ts_codes: list, trade_date: str = None,
+                         days: int = 3) -> list:
+        """
+        获取特定股票的相关新闻（通过关键词匹配）
+
+        参数:
+            ts_codes: 股票代码列表 (如 ["000001.SZ", "600519.SH"])
+            trade_date: 交易日
+            days: 回溯天数
+
+        返回: [{"title": str, "content": str, "ts_code": str, "name": str}]
+        """
+        # 先获取股票名称映射
+        self._ensure_stock_basic()
+        stock_basic = db_cache.get_stock_basic()
+        name_map = {}
+        if not stock_basic.empty:
+            for _, row in stock_basic.iterrows():
+                name_map[row['ts_code']] = row.get('name', '')
+
+        # 获取全量新闻
+        all_news = self.fetch_news(trade_date=trade_date, days=days)
+
+        # 按股票名称匹配
+        stock_news = []
+        for ts_code in ts_codes:
+            name = name_map.get(ts_code, '')
+            if not name:
+                continue
+            # 名称长度>=2 才匹配，避免误匹配
+            if len(name) < 2:
+                continue
+            for news in all_news:
+                title = news.get('title', '')
+                content = news.get('content', '')
+                if name in title or name in content:
+                    stock_news.append({
+                        "title": title,
+                        "content": content,
+                        "ts_code": ts_code,
+                        "name": name,
+                        "src": news.get("src", "")
+                    })
+
+        return stock_news
+
     # ========== 内部辅助方法 ==========
 
     def _get_industry_name_map(self) -> dict:

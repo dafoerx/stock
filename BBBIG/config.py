@@ -86,6 +86,13 @@ STOP_LOSS_MODE = os.environ.get("STOP_LOSS_MODE", "close_confirmed")  # close_co
 AI_TEMPERATURE = 0.1   # AI温度（越低越确定性）
 AI_MAX_TOKENS = 4096
 
+# ========== 消息面情绪分析（FinGPT 风格） ==========
+SENTIMENT_ENABLED = True          # 是否启用情绪分析过滤（设为False可跳过此步骤）
+SENTIMENT_NEGATIVE_THRESHOLD = -0.3  # 利空过滤阈值（情绪分数低于此值的行业/个股被过滤）
+SENTIMENT_PENALTY_WEIGHT = 5.0    # 情绪降权系数（用于多因子评分中的情绪惩罚）
+SENTIMENT_NEWS_DAYS = 3           # 新闻回溯天数（获取近N个交易日的新闻）
+SENTIMENT_MAX_NEWS_PER_BATCH = 15 # 每个行业/个股最多分析的新闻条数
+
 # 每日执行时间（24小时制）
 DAILY_RUN_HOUR = 18
 DAILY_RUN_MINUTE = 0

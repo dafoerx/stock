@@ -17,7 +17,8 @@ from BBBIG.deepseek_client import deepseek
 from BBBIG.config import (
     TOP_N, KLINE_DAYS, MIN_MARKET_CAP, MIN_VOLUME,
     FACTOR_WEIGHTS, MAX_SAME_INDUSTRY, MARKET_RISK_THRESHOLD,
-    AI_TEMPERATURE, AI_MAX_TOKENS, STRATIFIED_SAMPLING
+    AI_TEMPERATURE, AI_MAX_TOKENS, STRATIFIED_SAMPLING,
+    SENTIMENT_ENABLED, SENTIMENT_NEWS_DAYS, SENTIMENT_PENALTY_WEIGHT
 )
 
 logger = logging.getLogger("BBBIG")
@@ -849,8 +850,109 @@ def run_stock_selection(selection_date: str = None) -> dict:
         extra_klines = _fetch_kline_batch(missing_codes, days=KLINE_DAYS, end_date_str=analysis_date)
         kline_map.update(extra_klines)
 
-    # Step 5: 构造增强版大模型 prompt
-    logger.info("[5/6] 调用 DeepSeek 大模型进行综合分析...")
+    # Step 5: 消息面情绪过滤（FinGPT 风格）
+    sentiment_log = []
+    if SENTIMENT_ENABLED:
+        logger.info("[5/7] 消息面情绪分析（FinGPT 风格）...")
+        try:
+            from BBBIG.sentiment_analyzer import (
+                sentiment_analyzer, aggregate_news_by_industry, aggregate_news_by_stock
+            )
+            from BBBIG.db_cache import db_cache
+
+            # 5a. 获取近期新闻
+            news_list = fetcher.fetch_news(trade_date=analysis_date, days=SENTIMENT_NEWS_DAYS)
+
+            if news_list:
+                # 5b. 构建行业→新闻映射
+                stock_basic = db_cache.get_stock_basic()
+                stock_basic_map = {}
+                if not stock_basic.empty:
+                    stock_basic_map = dict(zip(stock_basic['ts_code'], stock_basic['industry']))
+
+                # 只分析候选股涉及的行业
+                candidate_industries = set(candidates['所处行业'].dropna().unique())
+                industry_news = aggregate_news_by_industry(news_list, stock_basic_map)
+                # 过滤只保留候选行业
+                industry_news = {k: v for k, v in industry_news.items() if k in candidate_industries}
+
+                # 5c. 获取候选股的个股新闻
+                candidate_codes = candidates['代码'].tolist()
+                stock_news_map = aggregate_news_by_stock(news_list, candidate_codes)
+
+                # 补充: 对候选股做关键词匹配获取更多个股相关新闻
+                if len(stock_news_map) < len(candidate_codes) * 0.3:
+                    ts_codes = [f"{c}.SH" if c.startswith('6') else f"{c}.SZ" for c in candidate_codes[:40]]
+                    extra_stock_news = fetcher.fetch_stock_news(ts_codes, trade_date=analysis_date, days=SENTIMENT_NEWS_DAYS)
+                    for news in extra_stock_news:
+                        code = news['ts_code'].split('.')[0]
+                        key = f"{code}_{news['name']}"
+                        if key not in stock_news_map:
+                            stock_news_map[key] = []
+                        stock_news_map[key].append(news['title'])
+
+                # 5d. 调用 DeepSeek 进行情绪打分
+                industry_sentiment = {}
+                stock_sentiment = {}
+
+                # 检查缓存
+                cache_date = analysis_date or datetime.now().strftime('%Y%m%d')
+                cached_ind = db_cache.get_sentiment('industry', cache_date)
+                cached_stk = db_cache.get_sentiment('stock', cache_date)
+
+                if cached_ind:
+                    industry_sentiment = cached_ind
+                    logger.info(f"  行业情绪缓存命中 {len(cached_ind)} 条")
+                elif industry_news:
+                    industry_sentiment = sentiment_analyzer.analyze_industry_sentiment(industry_news)
+                    if industry_sentiment:
+                        db_cache.save_sentiment_batch('industry', cache_date, industry_sentiment)
+
+                if cached_stk:
+                    stock_sentiment = cached_stk
+                    logger.info(f"  个股情绪缓存命中 {len(cached_stk)} 条")
+                elif stock_news_map:
+                    stock_sentiment = sentiment_analyzer.analyze_stock_sentiment(stock_news_map)
+                    if stock_sentiment:
+                        db_cache.save_sentiment_batch('stock', cache_date, stock_sentiment)
+
+                # 5e. 执行过滤
+                if industry_sentiment or stock_sentiment:
+                    candidates, sentiment_log = sentiment_analyzer.filter_by_sentiment(
+                        candidates, industry_sentiment, stock_sentiment
+                    )
+                    logger.info(f"  情绪过滤后剩余 {len(candidates)} 只候选股")
+
+                    # 将情绪信息汇总到 result
+                    sentiment_summary = []
+                    for ind, data in industry_sentiment.items():
+                        if data.get('label') == '利空':
+                            sentiment_summary.append(f"  ⚠ {ind}: {data['label']}({data['score']:+.2f}) — {data.get('reason','')}")
+                        elif data.get('label') == '利好':
+                            sentiment_summary.append(f"  ✅ {ind}: {data['label']}({data['score']:+.2f}) — {data.get('reason','')}")
+                    if sentiment_summary:
+                        result["sentiment_summary"] = "\n".join(sentiment_summary)
+                else:
+                    logger.info("  无有效情绪分析结果，跳过过滤")
+            else:
+                logger.info("  未获取到近期新闻，跳过情绪分析")
+
+        except Exception as e:
+            logger.warning(f"情绪分析异常，跳过: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+    else:
+        logger.info("[5/7] 情绪分析已禁用，跳过")
+
+    result["sentiment_log"] = sentiment_log
+
+    if candidates.empty:
+        logger.error("情绪过滤后无候选股票")
+        result["analysis"] = "错误：情绪过滤后无候选股票"
+        return result
+
+    # Step 6: 构造增强版大模型 prompt
+    logger.info("[6/7] 调用 DeepSeek 大模型进行综合分析...")
 
     # 根据风险等级调整推荐数量
     effective_top_n = TOP_N
@@ -966,8 +1068,8 @@ def run_stock_selection(selection_date: str = None) -> dict:
 当前日期: {analysis_date_display}
 
 {result['hot_sectors']}
-
-以下是量化9因子预筛选后的候选股票（量化已覆盖趋势/动量/量能/估值/板块/基本面等维度）：
+{f"【消息面情绪概览】" + chr(10) + result.get('sentiment_summary', '无显著利空/利好') + chr(10) if result.get('sentiment_summary') else ''}
+以下是量化9因子预筛选后的候选股票（量化已覆盖趋势/动量/量能/估值/板块/基本面等维度，已过滤消息面强烈利空标的）：
 
 {''.join(stock_summaries[:40])}
 
@@ -1032,9 +1134,9 @@ def run_stock_selection(selection_date: str = None) -> dict:
 
     logger.info(f"选股完成，推荐 {len(result['recommendations'])} 只股票")
 
-    # Step 6: 自动回测验证
+    # Step 7: 自动回测验证
     if result["recommendations"]:
-        logger.info("[6/6] 对推荐股票进行回测验证...")
+        logger.info("[7/7] 对推荐股票进行回测验证...")
         from BBBIG.backtester import backtest_stock_list
         backtest_report = backtest_stock_list(result["recommendations"], weeks_list=[1, 2, 3], reference_date=analysis_date)
         result["backtest_report"] = backtest_report
@@ -1055,7 +1157,7 @@ def run_stock_selection(selection_date: str = None) -> dict:
             result["recommendations"] = sorted_recs
             logger.info("推荐股票已按回测盈利概率重新排序")
     else:
-        logger.info("[6/6] 无推荐股票，跳过回测")
+        logger.info("[7/7] 无推荐股票，跳过回测")
 
     return result
 
@@ -1085,6 +1187,17 @@ def format_selection_report(result: dict) -> str:
     if result.get("market_risk_assessment"):
         lines.append("\n【市场风险评估】")
         lines.append(result["market_risk_assessment"])
+
+    # 情绪分析摘要
+    if result.get("sentiment_summary"):
+        lines.append("\n【📰 消息面情绪分析】")
+        lines.append(result["sentiment_summary"])
+    sentiment_log = result.get("sentiment_log", [])
+    if sentiment_log:
+        lines.append(f"\n  消息面过滤移除 {len(sentiment_log)} 只标的：")
+        for log_item in sentiment_log:
+            lines.append(f"  ❌ {log_item['code']} {log_item['name']} "
+                         f"({log_item['industry']}): 情绪{log_item['score']:+.2f} — {log_item['reason']}")
 
     if result.get("recommendations"):
         has_backtest = any("backtest_win_rate" in r for r in result["recommendations"])
