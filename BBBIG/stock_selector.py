@@ -777,6 +777,9 @@ def run_stock_selection(selection_date: str = None) -> dict:
 
     # 粗筛：基础面过滤
     rough_df = all_stocks.copy()
+    # 排除指定代码前缀的股票（如300=创业板）
+    if EXCLUDE_CODE_PREFIXES:
+        rough_df = rough_df[~rough_df["代码"].str.startswith(EXCLUDE_CODE_PREFIXES)]
     rough_df = rough_df[rough_df["总市值"] >= MIN_MARKET_CAP]
     rough_df = rough_df[rough_df["成交额"] >= MIN_VOLUME]
     rough_df = rough_df[(rough_df["市盈率动"] > 0) & (rough_df["市盈率动"] < 200)]

@@ -248,7 +248,10 @@ def _quant_select_at_date(analysis_date: str, top_n: int = TOP_N) -> list:
 
     # 基础面过滤
     df = all_stocks.copy()
-    from BBBIG.config import MIN_MARKET_CAP, MIN_VOLUME
+    from BBBIG.config import MIN_MARKET_CAP, MIN_VOLUME, EXCLUDE_CODE_PREFIXES
+    # 排除指定代码前缀的股票（如300=创业板）
+    if EXCLUDE_CODE_PREFIXES:
+        df = df[~df["代码"].str.startswith(EXCLUDE_CODE_PREFIXES)]
     df = df[df["总市值"] >= MIN_MARKET_CAP]
     df = df[df["成交额"] >= MIN_VOLUME]
     df = df[(df["市盈率动"] > 0) & (df["市盈率动"] < 200)]

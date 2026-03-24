@@ -49,6 +49,7 @@ TOP_N = 10  # 推荐股票数量
 KLINE_DAYS = 30  # K线分析天数（获取30天数据）
 MIN_MARKET_CAP = 50e8  # 最小市值 50亿
 MIN_VOLUME = 1e8  # 最小成交额 1亿
+EXCLUDE_CODE_PREFIXES = ("300",)  # 默认排除的股票代码前缀（300=创业板）
 
 # ========== 多因子评分权重 ==========
 FACTOR_WEIGHTS = {
