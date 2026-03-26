@@ -266,13 +266,16 @@ class BBBIGSimulator:
         print(sim.format_report(report))
     """
 
-    def __init__(self, initial_capital: float = 30000.0, sim_weeks: int = 4):
+    def __init__(self, initial_capital: float = 30000.0, sim_weeks: int = 4,
+                 quant_mode: bool = False):
         """
         :param initial_capital: 初始资金（元）
         :param sim_weeks: 回测总周数（从多少周前开始）
+        :param quant_mode: 是否使用纯量化选股模式（不调AI，用多因子评分替代）
         """
         self.initial_capital = initial_capital
         self.sim_weeks = sim_weeks
+        self.quant_mode = quant_mode
 
         self.cash = initial_capital          # 当前可用资金
         self.positions: dict[str, Position] = {}   # code -> Position（持有中）
@@ -612,18 +615,31 @@ class BBBIGSimulator:
 
     def _run_weekly_selection(self, selection_date: str, risk_level: str) -> list:
         """
-        在 selection_date 重新运行完整选股（调用 stock_selector.run_stock_selection）。
+        在 selection_date 重新运行完整选股。
+        quant_mode=True 时使用纯量化多因子选股（不需要AI）。
         通过设置环境变量 BBBIG_BACKTEST_DATE 让 fetcher 的缓存查询以该日期为基准。
         返回推荐股列表。
         """
-        from BBBIG.stock_selector import run_stock_selection
-        logger.info(f"  [选股] 模拟 {selection_date} 的选股流程（真实AI选股）...")
         prev_backtest_date = os.environ.get("BBBIG_BACKTEST_DATE")
         os.environ["BBBIG_BACKTEST_DATE"] = selection_date
         try:
+            if self.quant_mode:
+                return self._run_quant_selection(selection_date, risk_level)
+            else:
+                return self._run_ai_selection(selection_date, risk_level)
+        finally:
+            if prev_backtest_date is None:
+                os.environ.pop("BBBIG_BACKTEST_DATE", None)
+            else:
+                os.environ["BBBIG_BACKTEST_DATE"] = prev_backtest_date
+
+    def _run_ai_selection(self, selection_date: str, risk_level: str) -> list:
+        """AI选股模式（需要 DeepSeek API）"""
+        from BBBIG.stock_selector import run_stock_selection
+        logger.info(f"  [选股] 模拟 {selection_date} 的选股流程（真实AI选股）...")
+        try:
             result = run_stock_selection(selection_date=selection_date)
             recs = result.get("recommendations", [])
-            # 如果大盘风险更新了，取最新的
             market_risk = result.get("market_risk", {})
             if market_risk:
                 risk_level = market_risk.get("risk_level", risk_level)
@@ -632,11 +648,53 @@ class BBBIGSimulator:
         except Exception as e:
             logger.error(f"  [选股] 选股失败: {e}")
             return [], risk_level
-        finally:
-            if prev_backtest_date is None:
-                os.environ.pop("BBBIG_BACKTEST_DATE", None)
+
+    def _run_quant_selection(self, selection_date: str, risk_level: str) -> list:
+        """纯量化选股模式（不需要AI，用多因子评分）"""
+        from BBBIG.backtester import _quant_select_at_date
+        logger.info(f"  [选股] 模拟 {selection_date} 的选股流程（纯量化模式）...")
+        try:
+            recs = _quant_select_at_date(selection_date, top_n=10)
+            # 为每只候选分配仓位权重
+            for i, rec in enumerate(recs):
+                rec["rank"] = i + 1
+                rec["position_weight"] = "10%"  # 均分仓位
+            # 纯量化模式下通过大盘行情判断风险等级
+            risk_level = self._estimate_market_risk_quant(selection_date, risk_level)
+            logger.info(f"  [选股] 共选出 {len(recs)} 只股票，大盘风险={risk_level}")
+            return recs, risk_level
+        except Exception as e:
+            logger.error(f"  [选股] 纯量化选股失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return [], risk_level
+
+    def _estimate_market_risk_quant(self, date_str: str, fallback_risk: str) -> str:
+        """纯量化模式下，用沪深300指数估算大盘风险等级"""
+        try:
+            # 获取沪深300指数近20日数据
+            start_dt = datetime.strptime(date_str, "%Y%m%d") - timedelta(days=40)
+            start_str = start_dt.strftime("%Y%m%d")
+            kline = _get_kline_for_date_range("399300.SZ", start_str, date_str)
+            if kline is None or kline.empty:
+                # 尝试上证指数
+                kline = _get_kline_for_date_range("000001.SH", start_str, date_str)
+            if kline is None or len(kline) < 10:
+                return fallback_risk
+            recent = kline.tail(20)
+            close_5d = kline.tail(5)["收盘"]
+            change_5d = (close_5d.iloc[-1] - close_5d.iloc[0]) / close_5d.iloc[0] * 100
+            ma20 = recent["收盘"].mean()
+            latest_close = float(kline.iloc[-1]["收盘"])
+            if change_5d < -3.0 or latest_close < ma20 * 0.97:
+                return "高"
+            elif change_5d < -1.0 or latest_close < ma20:
+                return "中"
             else:
-                os.environ["BBBIG_BACKTEST_DATE"] = prev_backtest_date
+                return "低"
+        except Exception as e:
+            logger.debug(f"  大盘风险估算失败: {e}")
+            return fallback_risk
 
     def _buy_from_selections(self, recs: list, buy_date: str, total_budget: float):
         """
@@ -982,8 +1040,10 @@ class BBBIGSimulator:
 
 # ========== CLI 入口 ==========
 
-def run_simulation(initial_capital: float = 30000.0, sim_weeks: int = 4) -> dict:
-    sim = BBBIGSimulator(initial_capital=initial_capital, sim_weeks=sim_weeks)
+def run_simulation(initial_capital: float = 30000.0, sim_weeks: int = 4,
+                   quant_mode: bool = False) -> dict:
+    sim = BBBIGSimulator(initial_capital=initial_capital, sim_weeks=sim_weeks,
+                         quant_mode=quant_mode)
     report = sim.run()
     print(BBBIGSimulator.format_report(report))
     return report
@@ -995,4 +1055,5 @@ if __name__ == "__main__":
                         format="%(asctime)s [%(levelname)s] %(message)s")
     capital = float(sys.argv[1]) if len(sys.argv) > 1 else 30000.0
     weeks   = int(sys.argv[2])   if len(sys.argv) > 2 else 4
-    run_simulation(capital, weeks)
+    quant   = "--quant" in sys.argv or "-q" in sys.argv
+    run_simulation(capital, weeks, quant_mode=quant)

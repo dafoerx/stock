@@ -6,10 +6,10 @@ BBBIG 系统配置文件
 import os
 import json
 
-# DeepSeek API 配置
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "***")
-DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+# AI 大模型 API 配置（兼容 OpenAI 格式的自定义模型）
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "740B6527-A51F-4C02-BF65-EE035119D39F")
+DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://capi.quan2go.com/v1")
+DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "gpt-5.4")
 
 # Tushare Pro 配置
 TUSHARE_TOKEN = os.environ.get("TUSHARE_TOKEN", "***")
@@ -33,7 +33,8 @@ def resolve_db_file():
     explicit_db_file = os.environ.get("BBBIG_DB_FILE")
     if explicit_db_file:
         return os.path.abspath(explicit_db_file)
-    if os.path.exists(SHARED_DB_FILE):
+    # 共享DB需要存在且非空（0字节的空文件不算有效数据库）
+    if os.path.exists(SHARED_DB_FILE) and os.path.getsize(SHARED_DB_FILE) > 0:
         return SHARED_DB_FILE
     return LOCAL_DB_FILE
 

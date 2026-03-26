@@ -190,19 +190,25 @@ def cmd_simulate(args):
     from BBBIG.backtest.simulator import run_simulation
     capital = 30000.0
     weeks = 4
-    if len(args) >= 1:
+    quant_mode = False
+    # 解析参数：支持 --quant 或 -q 开关
+    positional = [a for a in args if not a.startswith('-')]
+    if '--quant' in args or '-q' in args:
+        quant_mode = True
+    if len(positional) >= 1:
         try:
-            capital = float(args[0])
+            capital = float(positional[0])
         except ValueError:
-            print("用法: python -m BBBIG.main simulate [初始资金] [回测周数]")
+            print("用法: python -m BBBIG.main simulate [初始资金] [回测周数] [--quant]")
             return
-    if len(args) >= 2:
+    if len(positional) >= 2:
         try:
-            weeks = int(args[1])
+            weeks = int(positional[1])
         except ValueError:
             pass
-    print(f"开始策略模拟回测，初始资金={capital:,.0f}元，回测{weeks}周...\n")
-    run_simulation(capital, weeks)
+    mode_str = "纯量化模式（不调AI）" if quant_mode else "AI模式"
+    print(f"开始策略模拟回测，初始资金={capital:,.0f}元，回测{weeks}周，{mode_str}...\n")
+    run_simulation(capital, weeks, quant_mode=quant_mode)
 
 
 def print_usage():
@@ -249,7 +255,7 @@ def _check_env():
         missing.append("TUSHARE_TOKEN")
     if missing:
         print(f"错误: 请设置环境变量: {', '.join(missing)}")
-        print("示例: export DEEPSEEK_API_KEY=sk-xxx && export TUSHARE_TOKEN=xxx")
+        print("示例: export DEEPSEEK_API_KEY=your-api-key && export TUSHARE_TOKEN=xxx")
         sys.exit(1)
 
 
@@ -262,7 +268,11 @@ def main():
 
     # 需要 API 的命令，启动前校验环境变量
     cmd = sys.argv[1].lower()
-    if cmd in ("select", "analyze", "run", "serve", "backtest", "qbacktest", "simulate"):
+    # simulate --quant 模式不需要 API Key
+    needs_api = cmd in ("select", "analyze", "run", "serve", "backtest")
+    if cmd == "simulate" and ("--quant" not in sys.argv and "-q" not in sys.argv):
+        needs_api = True
+    if needs_api:
         _check_env()
 
     command = sys.argv[1].lower()
